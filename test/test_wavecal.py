@@ -1,8 +1,14 @@
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
 from pyreduce.extract import extract
-from pyreduce.wavelength_calibration import LineList, WavelengthCalibration
+from pyreduce.wavelength_calibration import (
+    LineList,
+    WavelengthCalibration,
+    WavelengthCalibrationInitialize,
+)
 
 
 class TestLineList:
@@ -249,7 +255,7 @@ class TestWavelengthCalibrationCreateImage:
     def test_create_image_basic(self):
         """Test creating reference image from lines."""
         wc = WavelengthCalibration(plot=False)
-        wc.nord = 2
+        wc.ntrace = 2
         wc.ncol = 100
 
         lines = np.zeros(2, dtype=LineList.dtype)
@@ -298,7 +304,7 @@ class TestWavelengthCalibrationMakeWave:
     def test_make_wave_1d(self):
         """Test creating wavelength image in 1D mode."""
         wc = WavelengthCalibration(dimensionality="1D", degree=1, plot=False)
-        wc.nord = 2
+        wc.ntrace = 2
         wc.ncol = 100
 
         solution = np.array(
@@ -319,7 +325,7 @@ class TestWavelengthCalibrationMakeWave:
     def test_make_wave_2d(self):
         """Test creating wavelength image in 2D mode."""
         wc = WavelengthCalibration(dimensionality="2D", degree=(1, 1), plot=False)
-        wc.nord = 2
+        wc.ntrace = 2
         wc.ncol = 100
 
         # Solution: wavelength = 5000 + 0.1*x + 1000*order
@@ -337,6 +343,780 @@ class TestWavelengthCalibrationMakeWave:
         assert wave_img[1, 0] == pytest.approx(6000.0)
 
 
+class TestWavelengthsFromTraces:
+    """Unit tests for wavelengths_from_traces helper."""
+
+    @pytest.mark.unit
+    def test_empty_traces(self):
+        """Empty trace list returns None."""
+        from pyreduce.reduce import wavelengths_from_traces
+
+        result = wavelengths_from_traces([])
+        assert result is None
+
+    @pytest.mark.unit
+    def test_traces_without_wave(self):
+        """Traces without wavelength data return None."""
+        from pyreduce.reduce import wavelengths_from_traces
+        from pyreduce.trace_model import Trace
+
+        traces = [
+            Trace(m=0, group="A", pos=np.array([1, 0, 100]), column_range=(0, 100)),
+            Trace(m=1, group="A", pos=np.array([1, 0, 200]), column_range=(0, 100)),
+        ]
+        result = wavelengths_from_traces(traces)
+        assert result is None
+
+    @pytest.mark.unit
+    def test_traces_with_1d_wave(self):
+        """Traces with 1D wavelength polynomials."""
+        from pyreduce.reduce import wavelengths_from_traces
+        from pyreduce.trace_model import Trace
+
+        # wave = 5000 + 0.1*x for order 0, 6000 + 0.1*x for order 1
+        traces = [
+            Trace(
+                m=0,
+                group="A",
+                pos=np.array([1, 0, 100]),
+                column_range=(0, 100),
+                wave=np.array([0.1, 5000]),
+            ),
+            Trace(
+                m=1,
+                group="A",
+                pos=np.array([1, 0, 200]),
+                column_range=(0, 100),
+                wave=np.array([0.1, 6000]),
+            ),
+        ]
+        result = wavelengths_from_traces(traces, ncol=100)
+
+        assert result.shape == (2, 100)
+        assert result[0, 0] == pytest.approx(5000.0)
+        assert result[0, 50] == pytest.approx(5005.0)
+        assert result[1, 0] == pytest.approx(6000.0)
+
+    @pytest.mark.unit
+    def test_traces_with_2d_wave(self):
+        """Traces with shared 2D wavelength polynomial."""
+        from pyreduce.reduce import wavelengths_from_traces
+        from pyreduce.trace_model import Trace
+
+        # 2D poly: wavelength = 5000 + 0.1*x + 1000*idx
+        wave_2d = np.array([[5000.0, 1000.0], [0.1, 0.0]])
+        traces = [
+            Trace(
+                m=0,
+                group="A",
+                pos=np.array([1, 0, 100]),
+                column_range=(0, 100),
+                wave=wave_2d,
+                _wave_idx=0,
+            ),
+            Trace(
+                m=1,
+                group="A",
+                pos=np.array([1, 0, 200]),
+                column_range=(0, 100),
+                wave=wave_2d,
+                _wave_idx=1,
+            ),
+        ]
+        result = wavelengths_from_traces(traces, ncol=100)
+
+        assert result.shape == (2, 100)
+        assert result[0, 0] == pytest.approx(5000.0)
+        assert result[1, 0] == pytest.approx(6000.0)
+
+
+class TestWavecalPerGroupSaveLoad:
+    """Unit tests for per-group wavecal save/load."""
+
+    @pytest.fixture
+    def mock_instrument(self):
+        from pyreduce.instruments.instrument_info import load_instrument
+
+        return load_instrument("UVES")
+
+    @pytest.fixture
+    def wavecal_master_step(self, mock_instrument, tmp_path):
+        from pyreduce.configuration import load_config
+        from pyreduce.reduce import WavelengthCalibrationMaster
+
+        config = load_config(None, "UVES")
+        return WavelengthCalibrationMaster(
+            mock_instrument,
+            "RED",
+            "test",
+            "2024-01-01",
+            str(tmp_path),
+            None,
+            **config["wavecal_master"],
+        )
+
+    @pytest.mark.unit
+    def test_savefile_for_group_all(self, wavecal_master_step, tmp_path):
+        """Single group 'all' uses standard filename."""
+        path = wavecal_master_step.savefile_for_group("all")
+        assert path.endswith(".wavecal_master.fits")
+        assert ".wavecal_master.all." not in path
+
+    @pytest.mark.unit
+    def test_savefile_for_group_named(self, wavecal_master_step, tmp_path):
+        """Named groups get group in filename."""
+        path = wavecal_master_step.savefile_for_group("A")
+        assert path.endswith("_A.wavecal_master.fits")
+
+    @pytest.mark.unit
+    def test_savefile_for_group_fiber(self, wavecal_master_step, tmp_path):
+        """Fiber groups get fiber_N in filename."""
+        path = wavecal_master_step.savefile_for_group("fiber_0")
+        assert path.endswith("_fiber_0.wavecal_master.fits")
+
+
+class TestWavecalFinalizeTraceUpdate:
+    """Unit tests for WavelengthCalibrationFinalize trace updates."""
+
+    @pytest.fixture
+    def mock_instrument(self):
+        from pyreduce.instruments.instrument_info import load_instrument
+
+        return load_instrument("UVES")
+
+    @pytest.fixture
+    def traces_with_groups(self):
+        """Create traces with different groups."""
+        from pyreduce.trace_model import Trace
+
+        return [
+            Trace(m=0, group="A", pos=np.array([1, 0, 100]), column_range=(0, 100)),
+            Trace(m=1, group="A", pos=np.array([1, 0, 150]), column_range=(0, 100)),
+            Trace(m=0, group="B", pos=np.array([1, 0, 200]), column_range=(0, 100)),
+            Trace(m=1, group="B", pos=np.array([1, 0, 250]), column_range=(0, 100)),
+        ]
+
+    @pytest.fixture
+    def traces_with_fibers(self):
+        """Create traces with fiber_idx for per-fiber mode.
+
+        Note: fiber_idx and group are mutually exclusive. These traces
+        use fiber_idx (individual fibers, not merged).
+        """
+        from pyreduce.trace_model import Trace
+
+        return [
+            Trace(
+                m=0,
+                pos=np.array([1, 0, 100]),
+                column_range=(0, 100),
+                fiber_idx=0,
+            ),
+            Trace(
+                m=1,
+                pos=np.array([1, 0, 150]),
+                column_range=(0, 100),
+                fiber_idx=0,
+            ),
+            Trace(
+                m=0,
+                pos=np.array([1, 0, 200]),
+                column_range=(0, 100),
+                fiber_idx=1,
+            ),
+            Trace(
+                m=1,
+                pos=np.array([1, 0, 250]),
+                column_range=(0, 100),
+                fiber_idx=1,
+            ),
+        ]
+
+    @pytest.mark.unit
+    def test_group_lookup_by_group_name(self, traces_with_groups):
+        """Traces are correctly grouped by group attribute."""
+        traces_by_group = {}
+        for i, t in enumerate(traces_with_groups):
+            g = str(t.group) if t.group is not None else "all"
+            if g not in traces_by_group:
+                traces_by_group[g] = []
+            traces_by_group[g].append((i, t))
+
+        assert "A" in traces_by_group
+        assert "B" in traces_by_group
+        assert len(traces_by_group["A"]) == 2
+        assert len(traces_by_group["B"]) == 2
+
+    @pytest.mark.unit
+    def test_group_lookup_by_fiber_idx(self, traces_with_fibers):
+        """Traces are correctly grouped by fiber_idx."""
+        traces_by_fiber = {}
+        for i, t in enumerate(traces_with_fibers):
+            if t.fiber_idx is not None:
+                fkey = f"fiber_{t.fiber_idx}"
+                if fkey not in traces_by_fiber:
+                    traces_by_fiber[fkey] = []
+                traces_by_fiber[fkey].append((i, t))
+
+        assert "fiber_0" in traces_by_fiber
+        assert "fiber_1" in traces_by_fiber
+        assert len(traces_by_fiber["fiber_0"]) == 2
+        assert len(traces_by_fiber["fiber_1"]) == 2
+
+    @pytest.mark.unit
+    def test_wavecal_finalize_saves_to_traces_1d(
+        self, mock_instrument, tmp_path, traces_with_groups
+    ):
+        """WavelengthCalibrationFinalize saves 1D wave polynomials to traces.fits."""
+        from astropy.io.fits import Header
+
+        from pyreduce.configuration import load_config
+        from pyreduce.reduce import WavelengthCalibrationFinalize
+        from pyreduce.trace_model import load_traces, save_traces
+        from pyreduce.wavelength_calibration import LineList
+
+        # Save initial traces
+        trace_file = tmp_path / "uves_red.traces.fits"
+        save_traces(str(trace_file), traces_with_groups, Header())
+
+        # Create step with 1D mode
+        config = load_config(None, "UVES")
+        config["wavecal"]["dimensionality"] = "1D"
+        step = WavelengthCalibrationFinalize(
+            mock_instrument,
+            "RED",
+            "test",
+            "2024-01-01",
+            str(tmp_path),
+            None,
+            **config["wavecal"],
+        )
+
+        # Create mock results with 1D polynomials (one per trace)
+        wave_A = np.array([[0.1, 5000], [0.1, 5500]])  # 2 traces in group A
+        wave_B = np.array([[0.1, 6000], [0.1, 6500]])  # 2 traces in group B
+        ll_A = LineList.from_list([5000], [0], [50], [3], [1.0], [True])
+        ll_B = LineList.from_list([6000], [0], [50], [3], [1.0], [True])
+
+        results = {"A": (wave_A, ll_A), "B": (wave_B, ll_B)}
+
+        # Update traces in-place and save
+        step._update_traces(traces_with_groups, results)
+        step.save(results, traces_with_groups)
+
+        # Load traces and verify
+        loaded_traces, _ = load_traces(str(trace_file))
+
+        # Group A traces should have individual wave polynomials
+        assert loaded_traces[0].wave is not None
+        assert loaded_traces[0].wave[1] == pytest.approx(5000)
+        assert loaded_traces[1].wave[1] == pytest.approx(5500)
+
+        # Group B traces should have individual wave polynomials
+        assert loaded_traces[2].wave is not None
+        assert loaded_traces[2].wave[1] == pytest.approx(6000)
+        assert loaded_traces[3].wave[1] == pytest.approx(6500)
+
+    @pytest.mark.unit
+    def test_wavecal_finalize_saves_to_traces_2d(
+        self, mock_instrument, tmp_path, traces_with_groups
+    ):
+        """WavelengthCalibrationFinalize saves 2D wave polynomial to all traces in group."""
+        from astropy.io.fits import Header
+
+        from pyreduce.configuration import load_config
+        from pyreduce.reduce import WavelengthCalibrationFinalize
+        from pyreduce.trace_model import load_traces, save_traces
+        from pyreduce.wavelength_calibration import LineList
+
+        # Save initial traces
+        trace_file = tmp_path / "uves_red.traces.fits"
+        save_traces(str(trace_file), traces_with_groups, Header())
+
+        # Create step with 2D mode (default)
+        config = load_config(None, "UVES")
+        config["wavecal"]["dimensionality"] = "2D"
+        step = WavelengthCalibrationFinalize(
+            mock_instrument,
+            "RED",
+            "test",
+            "2024-01-01",
+            str(tmp_path),
+            None,
+            **config["wavecal"],
+        )
+
+        # Create mock results with 2D polynomials (shared per group)
+        wave_A = np.array([[5000, 1000], [0.1, 0]])  # 2D poly for group A
+        wave_B = np.array([[6000, 1000], [0.1, 0]])  # 2D poly for group B
+        ll_A = LineList.from_list([5000], [0], [50], [3], [1.0], [True])
+        ll_B = LineList.from_list([6000], [0], [50], [3], [1.0], [True])
+
+        results = {"A": (wave_A, ll_A), "B": (wave_B, ll_B)}
+
+        # Update traces in-place and save
+        step._update_traces(traces_with_groups, results)
+        step.save(results, traces_with_groups)
+
+        # Load traces and verify
+        loaded_traces, _ = load_traces(str(trace_file))
+
+        # 2D polynomial is evaluated per-trace to 1D (np.polyfit convention)
+        # wave_A at idx 0: a_i = wave_A[i,0] → [5000, 0.1] → reversed [0.1, 5000]
+        # wave_A at idx 1: a_i = sum_j wave_A[i,j]*1^j → [6000, 0.1] → reversed [0.1, 6000]
+        assert loaded_traces[0].wave is not None
+        np.testing.assert_allclose(loaded_traces[0].wave, [0.1, 5000])
+        np.testing.assert_allclose(loaded_traces[1].wave, [0.1, 6000])
+
+        # wave_B at idx 0/1 in group B
+        np.testing.assert_allclose(loaded_traces[2].wave, [0.1, 6000])
+        np.testing.assert_allclose(loaded_traces[3].wave, [0.1, 7000])
+
+    @pytest.mark.unit
+    def test_wavecal_finalize_per_fiber_mode(
+        self, mock_instrument, tmp_path, traces_with_fibers
+    ):
+        """WavelengthCalibrationFinalize works with per_fiber mode (1D)."""
+        from astropy.io.fits import Header
+
+        from pyreduce.configuration import load_config
+        from pyreduce.reduce import WavelengthCalibrationFinalize
+        from pyreduce.trace_model import load_traces, save_traces
+        from pyreduce.wavelength_calibration import LineList
+
+        # Save initial traces
+        trace_file = tmp_path / "uves_red.traces.fits"
+        save_traces(str(trace_file), traces_with_fibers, Header())
+
+        # Create step with 1D mode
+        config = load_config(None, "UVES")
+        config["wavecal"]["dimensionality"] = "1D"
+        step = WavelengthCalibrationFinalize(
+            mock_instrument,
+            "RED",
+            "test",
+            "2024-01-01",
+            str(tmp_path),
+            None,
+            **config["wavecal"],
+        )
+
+        # Create mock results with fiber_N keys (1D polynomials per trace)
+        wave_f0 = np.array([[0.1, 5000], [0.1, 5500]])
+        wave_f1 = np.array([[0.1, 6000], [0.1, 6500]])
+        ll = LineList.from_list([5000], [0], [50], [3], [1.0], [True])
+
+        results = {"fiber_0": (wave_f0, ll), "fiber_1": (wave_f1, ll)}
+
+        # Update traces in-place and save
+        step._update_traces(traces_with_fibers, results)
+        step.save(results, traces_with_fibers)
+
+        # Load traces and verify
+        loaded_traces, _ = load_traces(str(trace_file))
+
+        # fiber_0 traces (indices 0, 1)
+        assert loaded_traces[0].wave is not None
+        assert loaded_traces[0].wave[1] == pytest.approx(5000)
+        assert loaded_traces[1].wave[1] == pytest.approx(5500)
+
+        # fiber_1 traces (indices 2, 3)
+        assert loaded_traces[2].wave is not None
+        assert loaded_traces[2].wave[1] == pytest.approx(6000)
+        assert loaded_traces[3].wave[1] == pytest.approx(6500)
+
+
+class TestLineAtlas:
+    """Unit tests for LineAtlas loading and synthetic spectrum generation."""
+
+    @pytest.fixture
+    def atlas_dir(self, tmp_path):
+        return tmp_path / "atlas"
+
+    def _write_list(self, atlas_dir, name, lines, two_col=True):
+        atlas_dir.mkdir(exist_ok=True)
+        path = atlas_dir / f"{name}_list.txt"
+        with open(path, "w") as f:
+            for w, el in lines:
+                if two_col:
+                    f.write(f"{w} {el}\n")
+                else:
+                    f.write(f"{w}\n")
+        return path
+
+    @pytest.mark.unit
+    def test_two_column_list(self, atlas_dir):
+        """Two-column list file: wavelength + element label."""
+        from pyreduce.wavelength_calibration import LineAtlas
+
+        self._write_list(atlas_dir, "lamp", [(5000, "Ar"), (5100, "Th"), (5200, "Ar")])
+        a = LineAtlas("lamp", search_dirs=[str(atlas_dir)])
+        assert len(a.linelist) == 3
+        np.testing.assert_array_equal(a.linelist["wave"], [5000, 5100, 5200])
+        assert a.linelist["element"][0] == "Ar"
+        assert a.linelist["element"][1] == "Th"
+
+    @pytest.mark.unit
+    def test_one_column_list(self, atlas_dir):
+        """One-column list file: wavelengths only, element defaults to atlas name."""
+        from pyreduce.wavelength_calibration import LineAtlas
+
+        self._write_list(
+            atlas_dir, "lamp", [(5000, ""), (5100, ""), (5200, "")], two_col=False
+        )
+        a = LineAtlas("lamp", search_dirs=[str(atlas_dir)])
+        assert len(a.linelist) == 3
+        np.testing.assert_array_equal(a.linelist["wave"], [5000, 5100, 5200])
+        assert all(a.linelist["element"] == "lamp")
+
+    @pytest.mark.unit
+    def test_single_line_two_col(self, atlas_dir):
+        """Single-line two-column file."""
+        from pyreduce.wavelength_calibration import LineAtlas
+
+        self._write_list(atlas_dir, "lamp", [(7000, "Ne")])
+        a = LineAtlas("lamp", search_dirs=[str(atlas_dir)])
+        assert len(a.linelist) == 1
+        assert a.linelist["wave"][0] == pytest.approx(7000)
+        assert a.linelist["element"][0] == "Ne"
+
+    @pytest.mark.unit
+    def test_single_line_one_col(self, atlas_dir):
+        """Single-line one-column file."""
+        from pyreduce.wavelength_calibration import LineAtlas
+
+        self._write_list(atlas_dir, "lamp", [(8000, "")], two_col=False)
+        a = LineAtlas("lamp", search_dirs=[str(atlas_dir)])
+        assert len(a.linelist) == 1
+        assert a.linelist["wave"][0] == pytest.approx(8000)
+
+    @pytest.mark.unit
+    def test_long_element_names(self, atlas_dir):
+        """Element labels longer than 8 chars are preserved."""
+        from pyreduce.wavelength_calibration import LineAtlas
+
+        self._write_list(atlas_dir, "lamp", [(5000, "VeryLongElementName")])
+        a = LineAtlas("lamp", search_dirs=[str(atlas_dir)])
+        assert a.linelist["element"][0] == "VeryLongElementName"
+
+    @pytest.mark.unit
+    def test_synthesize_spectrum_from_list_only(self, atlas_dir):
+        """When only a _list.txt exists, a synthetic spectrum is generated."""
+        from pyreduce.wavelength_calibration import LineAtlas
+
+        waves = [(5000, "Ar"), (5500, "Ar"), (6000, "Ar")]
+        self._write_list(atlas_dir, "synth", waves)
+        a = LineAtlas("synth", search_dirs=[str(atlas_dir)])
+
+        assert len(a.wave) == 10_000
+        assert a.wave[0] < 5000
+        assert a.wave[-1] > 6000
+        assert a.flux.max() == pytest.approx(1.0)
+        # Peaks should be near the line positions
+        for w, _ in waves:
+            idx = np.searchsorted(a.wave, w)
+            assert a.flux[idx] > 0.5
+
+    @pytest.mark.unit
+    def test_synthesize_spectrum_shape(self):
+        """_synthesize_spectrum returns correct shape and normalization."""
+        from pyreduce.wavelength_calibration import LineAtlas
+
+        wpos = np.array([4000.0, 5000.0, 6000.0])
+        wave, flux = LineAtlas._synthesize_spectrum(wpos, n=5000, width=3)
+        assert wave.shape == (5000,)
+        assert flux.shape == (5000,)
+        assert flux.max() == pytest.approx(1.0)
+        assert flux.min() >= 0
+
+    @pytest.mark.unit
+    def test_search_dirs_priority(self, atlas_dir):
+        """Instrument dir is searched before defaults."""
+        from pyreduce.wavelength_calibration import LineAtlas
+
+        # thar exists in defaults -- put a custom one in atlas_dir
+        atlas_dir.mkdir(exist_ok=True)
+        custom = atlas_dir / "thar_list.txt"
+        custom.write_text("9999.0 Custom\n")
+
+        a = LineAtlas("thar", search_dirs=[str(atlas_dir)])
+        # Should pick up the custom list (with 1 line), not the default (4169 lines)
+        assert len(a.linelist) == 1
+        assert a.linelist["wave"][0] == pytest.approx(9999.0)
+
+    @pytest.mark.unit
+    def test_not_found_raises(self):
+        """Missing atlas raises FileNotFoundError."""
+        from pyreduce.wavelength_calibration import LineAtlas
+
+        with pytest.raises(FileNotFoundError, match="nonexistent"):
+            LineAtlas("nonexistent")
+
+    @pytest.mark.unit
+    def test_air_medium_converts(self, atlas_dir):
+        """medium='air' converts wavelengths."""
+        from pyreduce.wavelength_calibration import LineAtlas
+
+        self._write_list(atlas_dir, "lamp", [(5000, "Ar"), (6000, "Ar")])
+        a_vac = LineAtlas("lamp", medium="vac", search_dirs=[str(atlas_dir)])
+        a_air = LineAtlas("lamp", medium="air", search_dirs=[str(atlas_dir)])
+        # Air wavelengths should be slightly shorter
+        assert a_air.linelist["wave"][0] < a_vac.linelist["wave"][0]
+        assert a_air.wave[0] < a_vac.wave[0]
+
+
+class TestWavecalInitIdentify:
+    """Unit tests for WavelengthCalibrationInitialize.identify_lines_for_order."""
+
+    @staticmethod
+    def _make_spectrum(npix, peak_positions, sigma=2.5, amplitudes=None):
+        """Create synthetic spectrum with Gaussians at known pixel positions.
+
+        Includes a small noise floor so local minima exist between peaks
+        (as in real detector data with readnoise).
+        """
+        x = np.arange(npix, dtype=float)
+        spec = np.zeros(npix)
+        if amplitudes is None:
+            amplitudes = [1.0] * len(peak_positions)
+        for px, amp in zip(peak_positions, amplitudes, strict=False):
+            spec += amp * np.exp(-0.5 * ((x - px) / sigma) ** 2)
+        rng = np.random.default_rng(42)
+        spec += rng.uniform(1e-4, 1e-3, npix)
+        return spec
+
+    @staticmethod
+    def _make_atlas(wavelengths):
+        """Create minimal atlas with given wavelengths."""
+        linelist = np.zeros(len(wavelengths), dtype=[("wave", "f8")])
+        linelist["wave"] = np.sort(wavelengths)
+        return SimpleNamespace(linelist=linelist)
+
+    @staticmethod
+    def _make_init(**kwargs):
+        defaults = {
+            "degree": 2,
+            "plot": False,
+            "cutoff": 0,
+            "match_tolerance": 1.0,
+            "iterations": 3,
+            "edge_margin": 10,
+            "width_min": 1.0,
+            "width_max": 8.0,
+        }
+        defaults.update(kwargs)
+        return WavelengthCalibrationInitialize(**defaults)
+
+    @pytest.mark.unit
+    def test_synthetic_peaks_matched(self):
+        """Known Gaussian peaks with matching atlas lines are identified."""
+        npix = 1000
+        peak_pixels = np.array([100, 200, 300, 400, 500, 600, 700, 800, 900])
+        true_waves = 5000 + 0.05 * peak_pixels
+        spec = self._make_spectrum(npix, peak_pixels)
+        atlas = self._make_atlas(true_waves)
+        wci = self._make_init()
+
+        ll = wci.identify_lines_for_order(spec, atlas, (5000.0, 5050.0), order=0)
+
+        assert len(ll) >= 5
+        for i in range(len(ll)):
+            assert ll["wlc"][i] in true_waves
+
+    @pytest.mark.unit
+    def test_pixel_positions_accurate(self):
+        """Matched line pixel positions are close to the true peak centers."""
+        npix = 1000
+        peak_pixels = np.array([100, 250, 400, 550, 700, 850])
+        true_waves = 5000 + 0.05 * peak_pixels
+        spec = self._make_spectrum(npix, peak_pixels)
+        atlas = self._make_atlas(true_waves)
+        wci = self._make_init()
+
+        ll = wci.identify_lines_for_order(spec, atlas, (5000.0, 5050.0), order=0)
+
+        for i in range(len(ll)):
+            wl = ll["wlc"][i]
+            expected_px = (wl - 5000) / 0.05
+            assert abs(ll["posm"][i] - expected_px) < 1.0
+
+    @pytest.mark.unit
+    def test_order_stored_in_linelist(self):
+        """The order parameter is recorded in each output line."""
+        npix = 1000
+        peak_pixels = np.array([100, 300, 500, 700, 900])
+        true_waves = 5000 + 0.05 * peak_pixels
+        spec = self._make_spectrum(npix, peak_pixels)
+        atlas = self._make_atlas(true_waves)
+        wci = self._make_init()
+
+        ll = wci.identify_lines_for_order(spec, atlas, (5000.0, 5050.0), order=42)
+
+        assert len(ll) > 0
+        assert np.all(ll["order"] == 42)
+
+    @pytest.mark.unit
+    def test_zero_spectrum(self):
+        """All-zero spectrum returns empty LineList."""
+        spec = np.zeros(1000)
+        atlas = self._make_atlas([5010, 5020, 5030])
+        wci = self._make_init()
+
+        ll = wci.identify_lines_for_order(spec, atlas, (5000.0, 5050.0), order=0)
+        assert len(ll) == 0
+
+    @pytest.mark.unit
+    def test_constant_spectrum(self):
+        """Flat spectrum (no peaks) returns empty LineList."""
+        spec = np.full(1000, 100.0)
+        atlas = self._make_atlas([5010, 5020, 5030])
+        wci = self._make_init()
+
+        ll = wci.identify_lines_for_order(spec, atlas, (5000.0, 5050.0), order=0)
+        assert len(ll) == 0
+
+    @pytest.mark.unit
+    def test_edge_only_peaks_filtered(self):
+        """Peaks within edge_margin of the detector edges are rejected."""
+        npix = 1000
+        peak_pixels = [5, 995]
+        spec = self._make_spectrum(npix, peak_pixels)
+        atlas = self._make_atlas(5000 + 0.05 * np.array(peak_pixels))
+        wci = self._make_init(edge_margin=50)
+
+        ll = wci.identify_lines_for_order(spec, atlas, (5000.0, 5050.0), order=0)
+        assert len(ll) == 0
+
+    @pytest.mark.unit
+    def test_narrow_peaks_filtered(self):
+        """Peaks with FWHM below width_min are rejected."""
+        npix = 1000
+        # sigma=0.3 -> FWHM ~0.7 pixels, below width_min=1.0
+        peak_pixels = [200, 500, 800]
+        spec = self._make_spectrum(npix, peak_pixels, sigma=0.3)
+        atlas = self._make_atlas(5000 + 0.05 * np.array(peak_pixels))
+        wci = self._make_init(width_min=1.0)
+
+        ll = wci.identify_lines_for_order(spec, atlas, (5000.0, 5050.0), order=0)
+        assert len(ll) == 0
+
+    @pytest.mark.unit
+    def test_wide_peaks_filtered(self):
+        """Peaks with FWHM above width_max are rejected."""
+        npix = 1000
+        # sigma=10 -> FWHM ~23.5 pixels, above width_max=8.0
+        peak_pixels = [200, 500, 800]
+        spec = self._make_spectrum(npix, peak_pixels, sigma=10.0)
+        atlas = self._make_atlas(5000 + 0.05 * np.array(peak_pixels))
+        wci = self._make_init(width_max=8.0)
+
+        ll = wci.identify_lines_for_order(spec, atlas, (5000.0, 5050.0), order=0)
+        assert len(ll) == 0
+
+    @pytest.mark.unit
+    def test_no_atlas_lines_in_range(self):
+        """Atlas lines entirely outside wavelength range returns empty LineList."""
+        npix = 1000
+        peak_pixels = [200, 500, 800]
+        spec = self._make_spectrum(npix, peak_pixels)
+        atlas = self._make_atlas([8000.0, 8100.0, 8200.0])
+        wci = self._make_init()
+
+        ll = wci.identify_lines_for_order(spec, atlas, (5000.0, 5050.0), order=0)
+        assert len(ll) == 0
+
+    @pytest.mark.unit
+    def test_offset_voting_corrects_shift(self):
+        """A systematic shift in wave_range is corrected by offset voting."""
+        npix = 1000
+        peak_pixels = np.array([100, 200, 300, 400, 500, 600, 700, 800, 900])
+        true_waves = 5000 + 0.05 * peak_pixels
+        spec = self._make_spectrum(npix, peak_pixels)
+        atlas = self._make_atlas(true_waves)
+        wci = self._make_init()
+
+        # Shift wave_range by +0.5 A
+        ll = wci.identify_lines_for_order(spec, atlas, (5000.5, 5050.5), order=0)
+
+        assert len(ll) >= 5
+
+    @pytest.mark.unit
+    def test_too_few_peaks_for_degree(self):
+        """Fewer matchable peaks than degree+1 returns empty LineList."""
+        npix = 1000
+        # Only 2 peaks, but degree=2 needs at least 3
+        peak_pixels = np.array([300, 700])
+        true_waves = 5000 + 0.05 * peak_pixels
+        spec = self._make_spectrum(npix, peak_pixels)
+        atlas = self._make_atlas(true_waves)
+        wci = self._make_init(degree=2)
+
+        ll = wci.identify_lines_for_order(spec, atlas, (5000.0, 5050.0), order=0)
+        assert len(ll) == 0
+
+    @pytest.mark.unit
+    def test_minimum_viable_matches(self):
+        """Exactly degree+1 matching peaks still produces a result."""
+        npix = 1000
+        peak_pixels = np.array([200, 500, 800])
+        true_waves = 5000 + 0.05 * peak_pixels
+        spec = self._make_spectrum(npix, peak_pixels)
+        atlas = self._make_atlas(true_waves)
+        wci = self._make_init(degree=2)
+
+        ll = wci.identify_lines_for_order(spec, atlas, (5000.0, 5050.0), order=0)
+        assert len(ll) == 3
+
+    @pytest.mark.unit
+    def test_execute_multi_order(self, tmp_path):
+        """execute() combines lines from multiple orders."""
+        npix = 1000
+        norders = 3
+        peak_pixels = np.array([100, 300, 500, 700, 900])
+
+        spectrum = np.zeros((norders, npix))
+        wave_range = np.zeros((norders, 2))
+
+        atlas_dir = tmp_path / "atlas"
+        atlas_dir.mkdir()
+        with open(atlas_dir / "synlamp_list.txt", "w") as f:
+            for o in range(norders):
+                w0 = 5000 + o * 100
+                spectrum[o] = self._make_spectrum(npix, peak_pixels)
+                wave_range[o] = [w0, w0 + 0.05 * npix]
+                for px in peak_pixels:
+                    f.write(f"{w0 + 0.05 * px}\n")
+
+        wci = WavelengthCalibrationInitialize(
+            degree=2,
+            plot=False,
+            cutoff=0,
+            atlas_name="synlamp",
+            atlas_search_dirs=[str(atlas_dir)],
+        )
+        ll = wci.execute(spectrum, wave_range)
+
+        assert len(ll) >= 3 * norders
+        orders_found = set(ll["order"])
+        assert len(orders_found) == norders
+
+    @pytest.mark.unit
+    def test_cutoff_filters_faint_peaks(self):
+        """Peaks below the cutoff fraction of the maximum are rejected."""
+        npix = 1000
+        peak_pixels = [200, 500, 800]
+        # One bright peak (1.0), two faint (0.005 = below 1% cutoff)
+        spec = self._make_spectrum(npix, peak_pixels, amplitudes=[1.0, 0.005, 0.005])
+        true_waves = 5000 + 0.05 * np.array(peak_pixels)
+        atlas = self._make_atlas(true_waves)
+        wci = self._make_init(cutoff=0.01)
+
+        ll = wci.identify_lines_for_order(spec, atlas, (5000.0, 5050.0), order=0)
+
+        # Only the bright peak should survive
+        assert len(ll) <= 1
+
+
 # Tests that require instrument data follow below
 
 
@@ -344,39 +1124,42 @@ class TestWavelengthCalibrationMakeWave:
 @pytest.mark.downloads
 @pytest.mark.slow
 def test_wavecal(
-    files, instr, instrument, channel, mask, orders, settings, trace_range
+    files, instr, instrument, channel, mask, traces, settings, trace_range
 ):
     name = "wavecal_master"
     if len(files[name]) == 0:
         pytest.skip(f"No wavecal files found for instrument {instrument}")
 
-    orders, column_range = orders
     files = files[name][0]
     orig, thead = instr.load_fits(files, channel, mask=mask)
     thead["obase"] = (0, "base order number")
 
+    # Apply trace_range to traces
+    traces_subset = traces[trace_range[0] : trace_range[1]]
+
     # Extract wavecal spectrum
-    thar, _, _, _ = extract(
+    spectra = extract(
         orig,
-        orders,
+        traces_subset,
         gain=thead["e_gain"],
         readnoise=thead["e_readn"],
         dark=thead["e_drk"],
         extraction_type="simple",
-        column_range=column_range,
-        trace_range=trace_range,
         extraction_height=settings[name]["extraction_height"],
         plot=False,
     )
 
-    assert isinstance(thar, np.ndarray)
-    assert thar.ndim == 2
-    assert thar.shape[0] == trace_range[1] - trace_range[0]
-    assert thar.shape[1] == orig.shape[1]
-    assert np.issubdtype(thar.dtype, np.floating)
+    # Convert Spectrum objects to array for assertions
+    wavecal_spec = np.array([s.spec for s in spectra])
 
-    # assert np.min(thar) == 0
-    # assert np.max(thar) == 1
+    assert isinstance(wavecal_spec, np.ndarray)
+    assert wavecal_spec.ndim == 2
+    assert wavecal_spec.shape[0] == trace_range[1] - trace_range[0]
+    assert wavecal_spec.shape[1] == orig.shape[1]
+    assert np.issubdtype(wavecal_spec.dtype, np.floating)
+
+    # assert np.min(wavecal_spec) == 0
+    # assert np.max(wavecal_spec) == 1
 
     reference = instr.get_wavecal_filename(thead, channel, **settings["instrument"])
     reference = np.load(reference, allow_pickle=True)
@@ -389,7 +1172,7 @@ def test_wavecal(
         threshold=settings[name]["threshold"],
         degree=settings[name]["degree"],
     )
-    wave, solution, lines = module.execute(thar, linelist)
+    wave, solution, lines = module.execute(wavecal_spec, linelist)
 
     assert isinstance(wave, np.ndarray)
     assert wave.ndim == 2

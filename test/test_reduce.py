@@ -313,7 +313,7 @@ class TestTraceSaveLoad:
         step = reduce.Trace(
             mock_instrument, "RED", "", "", str(tmp_path), None, **config
         )
-        assert step.savefile.endswith(".traces.npz")
+        assert step.savefile.endswith(".traces.fits")
 
     @pytest.mark.unit
     def test_trace_save_load_roundtrip(self, mock_instrument, tmp_path):
@@ -339,15 +339,25 @@ class TestTraceSaveLoad:
         }
         step = reduce.Trace(mock_instrument, "", "", "", str(tmp_path), None, **config)
 
-        # Create fake trace data
+        # Create fake trace data as Trace objects
+        from pyreduce.trace_model import Trace as TraceData
+
         orders = np.array([[100.0, 0.01, 0.0], [200.0, 0.02, 0.0]])
         column_range = np.array([[10, 990], [20, 980]])
 
-        step.save(orders, column_range)
-        loaded_orders, loaded_cr = step.load()
+        step.trace_objects = [
+            TraceData(m=None, pos=orders[0], column_range=tuple(column_range[0])),
+            TraceData(m=None, pos=orders[1], column_range=tuple(column_range[1])),
+        ]
+        step.save()
+        trace_objects = step.load()
 
-        assert np.allclose(orders, loaded_orders)
-        assert np.allclose(column_range, loaded_cr)
+        # Verify trace objects match saved data
+        assert len(trace_objects) == 2
+        assert np.allclose(trace_objects[0].pos, orders[0])
+        assert np.allclose(trace_objects[1].pos, orders[1])
+        assert trace_objects[0].column_range == tuple(column_range[0])
+        assert trace_objects[1].column_range == tuple(column_range[1])
 
     @pytest.mark.unit
     def test_trace_save_load_with_heights(self, mock_instrument, tmp_path):
@@ -373,91 +383,43 @@ class TestTraceSaveLoad:
         }
         step = reduce.Trace(mock_instrument, "", "", "", str(tmp_path), None, **config)
 
-        # Create fake trace data with heights
+        # Create fake trace data with heights as Trace objects
+        from pyreduce.trace_model import Trace as TraceData
+
         orders = np.array([[100.0, 0.01, 0.0], [200.0, 0.02, 0.0]])
         column_range = np.array([[10, 990], [20, 980]])
-        step.heights = np.array([20.0, 25.0])
 
-        step.save(orders, column_range)
-        loaded_orders, loaded_cr = step.load()
+        step.trace_objects = [
+            TraceData(
+                m=None, pos=orders[0], column_range=tuple(column_range[0]), height=20.0
+            ),
+            TraceData(
+                m=None, pos=orders[1], column_range=tuple(column_range[1]), height=25.0
+            ),
+        ]
+        step.save()
+        trace_objects = step.load()
 
-        assert np.allclose(orders, loaded_orders)
-        assert np.allclose(column_range, loaded_cr)
-        assert step.heights is not None
-        assert np.allclose(step.heights, [20.0, 25.0])
-
-    @pytest.mark.unit
-    def test_trace_load_without_heights_backwards_compat(
-        self, mock_instrument, tmp_path
-    ):
-        """Test loading old trace file without heights returns None."""
-        config = {
-            "plot": False,
-            "degree": 4,
-            "min_cluster": 500,
-            "min_width": 10,
-            "filter_y": 10,
-            "noise": 100,
-            "bias_scaling": "none",
-            "norm_scaling": "none",
-            "degree_before_merge": 2,
-            "regularization": 0,
-            "closing_shape": (5, 5),
-            "opening_shape": (5, 5),
-            "auto_merge_threshold": 0.5,
-            "merge_min_threshold": 0.1,
-            "split_sigma": 3,
-            "border_width": 10,
-            "manual": False,
-        }
-        step = reduce.Trace(mock_instrument, "", "", "", str(tmp_path), None, **config)
-
-        # Manually save without heights (simulating old file format)
-        orders = np.array([[100.0, 0.01, 0.0]])
-        column_range = np.array([[10, 990]])
-        np.savez(step.savefile, traces=orders, column_range=column_range)
-
-        loaded_orders, loaded_cr = step.load()
-
-        assert np.allclose(orders, loaded_orders)
-        assert step.heights is None  # Backwards compat: missing heights -> None
+        # Verify trace objects match saved data
+        assert len(trace_objects) == 2
+        assert np.allclose(trace_objects[0].pos, orders[0])
+        assert np.allclose(trace_objects[1].pos, orders[1])
+        assert trace_objects[0].column_range == tuple(column_range[0])
+        assert trace_objects[1].column_range == tuple(column_range[1])
+        assert trace_objects[0].height == pytest.approx(20.0)
+        assert trace_objects[1].height == pytest.approx(25.0)
 
 
-class TestSlitCurvatureSaveLoad:
-    """Unit tests for SlitCurvatureDetermination save/load."""
+class TestSlitCurvatureDetermination:
+    """Unit tests for SlitCurvatureDetermination."""
 
     @pytest.fixture
     def mock_instrument(self):
         return load_instrument("UVES")
 
     @pytest.mark.unit
-    def test_curvature_savefile_name(self, mock_instrument, tmp_path):
-        """Test curvature savefile naming."""
-        config = {
-            "plot": False,
-            "curvature_cutoff": 3,
-            "extraction_height": 0.5,
-            "curve_height": 0.5,
-            "degree": 2,
-            "curve_degree": 2,
-            "dimensionality": "1D",
-            "peak_threshold": 10,
-            "peak_width": 1,
-            "window_width": 9,
-            "peak_function": "gaussian",
-            "bias_scaling": "none",
-            "norm_scaling": "none",
-            "extraction_method": "simple",
-            "collapse_function": "sum",
-        }
-        step = reduce.SlitCurvatureDetermination(
-            mock_instrument, "RED", "", "", str(tmp_path), None, **config
-        )
-        assert step.savefile.endswith(".curve.npz")
-
-    @pytest.mark.unit
-    def test_curvature_save_load_roundtrip(self, mock_instrument, tmp_path):
-        """Test saving and loading curvature results."""
+    def test_curvature_load_returns_none(self, mock_instrument, tmp_path):
+        """Curvature is stored in traces, load() always returns None."""
         config = {
             "plot": False,
             "curvature_cutoff": 3,
@@ -478,43 +440,7 @@ class TestSlitCurvatureSaveLoad:
         step = reduce.SlitCurvatureDetermination(
             mock_instrument, "", "", "", str(tmp_path), None, **config
         )
-
-        # Create fake curvature data
-        p1 = np.random.rand(10, 1000) * 0.01
-        p2 = np.random.rand(10, 1000) * 0.001
-
-        step.save(p1, p2)
-        loaded_p1, loaded_p2 = step.load()
-
-        assert np.allclose(p1, loaded_p1)
-        assert np.allclose(p2, loaded_p2)
-
-    @pytest.mark.unit
-    def test_curvature_load_missing_returns_none(self, mock_instrument, tmp_path):
-        """Test loading missing curvature returns None."""
-        config = {
-            "plot": False,
-            "curvature_cutoff": 3,
-            "extraction_height": 0.5,
-            "curve_height": 0.5,
-            "degree": 2,
-            "curve_degree": 2,
-            "dimensionality": "1D",
-            "peak_threshold": 10,
-            "peak_width": 1,
-            "window_width": 9,
-            "peak_function": "gaussian",
-            "bias_scaling": "none",
-            "norm_scaling": "none",
-            "extraction_method": "simple",
-            "collapse_function": "sum",
-        }
-        step = reduce.SlitCurvatureDetermination(
-            mock_instrument, "", "", "", str(tmp_path), None, **config
-        )
-        p1, p2 = step.load()
-        assert p1 is None
-        assert p2 is None
+        assert step.load() is None
 
 
 class TestBackgroundScatterSaveLoad:
@@ -793,3 +719,114 @@ def test_step_abstract(step_args):
 
     with pytest.raises(NotImplementedError):
         step.save()
+
+
+@pytest.mark.instrument
+@pytest.mark.downloads
+def test_1d_vs_2d_extraction(flat, orders):
+    """Compare 1D (vertical) and 2D (curved with p1=p2=0) extraction on real UVES data."""
+    import os
+    from pathlib import Path
+
+    from pyreduce.cwrappers import slitfunc, slitfunc_curved
+    from pyreduce.util import make_index
+
+    flat_img, flat_head = flat
+    if flat_img is None:
+        pytest.skip("No flat data available")
+
+    # Setup debug output directory
+    reduce_data = os.environ.get("REDUCE_DATA", os.path.expanduser("~/REDUCE_DATA"))
+    debug_dir = Path(reduce_data) / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    traces, column_range = orders
+
+    # Pick a middle order and a swath in the middle of it
+    nord = traces.shape[0]
+    order_idx = nord // 2
+    trace = traces[order_idx]
+    cr = column_range[order_idx]
+
+    # Swath parameters
+    swath_width = 300
+    extraction_height = 50
+    xlow = (cr[0] + cr[1]) // 2  # middle of order
+    xhigh = xlow + swath_width
+    if xhigh > cr[1]:
+        xhigh = cr[1]
+        xlow = xhigh - swath_width
+
+    # Get ycen for this swath
+    x = np.arange(xlow, xhigh)
+    ycen_full = np.polyval(trace, x)
+    ycen_int = np.floor(ycen_full).astype(int)
+    ycen = ycen_full - ycen_int  # fractional part for slitfunc
+
+    # Cut out swath (zero=xlow to get relative x indices 0..swath_width)
+    ylow = yhigh = extraction_height
+    index = make_index(ycen_int - ylow, ycen_int + yhigh, xlow, xhigh, zero=xlow)
+    swath_img = flat_img[index].astype(float)
+
+    # Common parameters
+    lambda_sp = 0
+    lambda_sf = 0.1
+    osample = 1
+
+    # 1D extraction
+    sp1, sl1, model1, unc1, mask1 = slitfunc(
+        swath_img, ycen, lambda_sp, lambda_sf, osample
+    )
+
+    # 2D extraction with zero curvature
+    yrange = (ylow, yhigh)
+    sp2, sl2, model2, unc2, mask2, info = slitfunc_curved(
+        swath_img,
+        ycen,
+        p1=0,
+        p2=0,
+        lambda_sp=lambda_sp,
+        lambda_sf=lambda_sf,
+        osample=osample,
+        yrange=yrange,
+    )
+
+    # Compare results
+    assert sp1.shape == sp2.shape, f"Spectrum shapes differ: {sp1.shape} vs {sp2.shape}"
+    assert sl1.shape == sl2.shape, f"Slitfunc shapes differ: {sl1.shape} vs {sl2.shape}"
+
+    # Report differences
+    sp_rel_diff = np.abs(sp1 - sp2) / np.maximum(sp1, 1)
+    sl_rel_diff = np.abs(sl1 - sl2) / np.maximum(sl1, 1e-10)
+    print(
+        f"\nSpectrum: max rel diff = {sp_rel_diff.max():.4f}, mean = {sp_rel_diff.mean():.4f}"
+    )
+    print(
+        f"Slitfunc: max rel diff = {sl_rel_diff.max():.4f}, mean = {sl_rel_diff.mean():.4f}"
+    )
+
+    # Save results to debug directory
+    outfile = debug_dir / "1d_vs_2d_extraction.npz"
+    np.savez(
+        outfile,
+        swath_img=swath_img,
+        ycen=ycen,
+        sp_1d=sp1,
+        sl_1d=sl1,
+        model_1d=model1,
+        unc_1d=unc1,
+        mask_1d=mask1,
+        sp_2d=sp2,
+        sl_2d=sl2,
+        model_2d=model2,
+        unc_2d=unc2,
+        mask_2d=mask2,
+        info_2d=info,
+    )
+    print(f"Saved results to {outfile}")
+
+    # Allow some tolerance since algorithms differ slightly
+    # Note: with larger swaths, the slit functions show a 1-element offset between 1D and 2D
+    np.testing.assert_allclose(
+        sp1, sp2, rtol=0.05, err_msg="Spectra differ significantly"
+    )

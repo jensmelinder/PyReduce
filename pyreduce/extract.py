@@ -21,10 +21,231 @@ from scipy.interpolate import interp1d
 from tqdm import tqdm
 
 from . import util
-from .cwrappers import slitfunc_curved
+from .spectra import Spectrum
+from .trace_model import Trace
 from .util import make_index
 
 logger = logging.getLogger(__name__)
+
+# Backend selection: set PYREDUCE_USE_CHARSLIT=1 to use charslit
+USE_CHARSLIT = os.environ.get("PYREDUCE_USE_CHARSLIT", "0") == "1"
+# Slitdelta correction: set PYREDUCE_USE_DELTAS=0 to disable (default enabled)
+USE_DELTAS = os.environ.get("PYREDUCE_USE_DELTAS", "1") == "1"
+
+if USE_CHARSLIT:
+    import charslit
+
+    logger.info("Using charslit extraction backend")
+    if not USE_DELTAS:
+        logger.info("Slitdelta correction disabled (PYREDUCE_USE_DELTAS=0)")
+else:
+    from . import cwrappers
+
+    logger.info("Using CFFI extraction backend")
+
+
+def _slitdec_charslit(
+    img,
+    ycen,
+    slitcurve,
+    slitdeltas,
+    lambda_sp,
+    lambda_sf,
+    osample,
+    yrange,
+    maxiter,
+    gain,
+    reject_threshold,
+    preset_slitfunc,
+):
+    """Call charslit.slitdec and convert results to the expected format.
+
+    Parameters
+    ----------
+    img : array[nrows, ncols]
+        Input image swath (may be masked array)
+    ycen : array[ncols]
+        Trace center positions (fractional)
+    slitcurve : array[ncols, 6]
+        Polynomial coefficients for slit curvature (c0..c5)
+    slitdeltas : array[nrows] or None
+        Per-row residual offsets
+    lambda_sp : float
+        Spectrum smoothing parameter
+    lambda_sf : float
+        Slit function smoothing parameter
+    osample : int
+        Oversampling factor
+    yrange : tuple[int, int]
+        Extraction range (below, above)
+    maxiter : int
+        Maximum iterations
+    gain : float
+        Detector gain
+    reject_threshold : float
+        Outlier rejection threshold in sigma units (passed as kappa to charslit)
+    preset_slitfunc : array or None
+        Preset slit function (not supported by charslit yet, ignored)
+
+    Returns
+    -------
+    sp : array[ncols]
+        Extracted spectrum
+    sl : array[nslitf]
+        Slit function
+    model : array[nrows, ncols]
+        Model image
+    unc : array[ncols]
+        Spectrum uncertainties
+    mask : array[nrows, ncols]
+        Output mask (True = bad)
+    info : array[5]
+        [success, chi2, status, niter, delta_x]
+    """
+    nrows, ncols = img.shape
+
+    # Get data and mask
+    mask_in = np.ma.getmaskarray(img)
+    data = np.ma.getdata(img).astype(np.float64)
+    data[~np.isfinite(data)] = 0
+    mask_in = mask_in | ~np.isfinite(data)
+
+    # Compute pixel uncertainties (shot noise)
+    pix_unc = np.abs(data) * gain
+    np.sqrt(pix_unc, out=pix_unc)
+    pix_unc[pix_unc < 1] = 1
+    pix_unc = pix_unc.astype(np.float64)
+
+    # Convert mask: numpy (True=bad) -> charslit (0=bad, 1=good)
+    mask_c = np.where(mask_in, 0, 1).astype(np.uint8)
+
+    # Ensure contiguous arrays
+    data = np.ascontiguousarray(data)
+    pix_unc = np.ascontiguousarray(pix_unc)
+    mask_c = np.ascontiguousarray(mask_c)
+
+    # charslit expects full ycen and does the integer/fractional split internally
+    ycen_c = np.ascontiguousarray(ycen.astype(np.float64))
+
+    # charslit expects slitcurve of shape (ncols, 6) - coeffs c0..c5
+    slitcurve_c = np.ascontiguousarray(slitcurve.astype(np.float64))
+
+    if slitdeltas is None:
+        slitdeltas = np.zeros(nrows, dtype=np.float64)
+    slitdeltas = np.ascontiguousarray(slitdeltas.astype(np.float64))
+
+    # Note: preset_slitfunc is not currently supported by charslit
+    if preset_slitfunc is not None:
+        logger.debug("preset_slitfunc is not yet supported by charslit, ignoring")
+
+    # Call charslit
+    result = charslit.slitdec(
+        data,
+        pix_unc,
+        mask_c,
+        ycen_c,
+        slitcurve_c,
+        slitdeltas,
+        osample=osample,
+        lambda_sP=float(lambda_sp),
+        lambda_sL=float(lambda_sf),
+        maxiter=maxiter,
+        kappa=float(reject_threshold),
+    )
+
+    sp = result["spectrum"]
+    sl = result["slitfunction"]
+    model = result["model"]
+    unc = result["uncertainty"]
+    return_code = result.get("return_code", 0)
+    info_arr = result.get("info", np.zeros(5))
+
+    # Convert mask back: charslit -> numpy (True=bad)
+    mask_out = result.get("mask", mask_c)
+    mask_out = mask_out == 0
+
+    # Build info array: charslit returns info as [success, cost, status, iter, delta_x]
+    if isinstance(info_arr, np.ndarray) and len(info_arr) >= 5:
+        info = info_arr
+    else:
+        info = np.array([float(return_code == 0), 0.0, float(return_code), 0.0, 0.0])
+
+    return sp, sl, model, unc, mask_out, info
+
+
+def _slitdec_cffi(
+    img,
+    ycen,
+    curvature,
+    lambda_sp,
+    lambda_sf,
+    osample,
+    yrange,
+    maxiter,
+    gain,
+    reject_threshold,
+    preset_slitfunc,
+):
+    """Call CFFI slitfunc_curved and return results in the same format as charslit.
+
+    This is the legacy extraction backend using the CFFI C extension.
+    Only supports curvature degrees 1-2 (p1, p2).
+    """
+    # Extract p1, p2 from curvature array
+    if curvature is not None:
+        p1 = curvature[:, 1] if curvature.shape[1] > 1 else np.zeros(curvature.shape[0])
+        p2 = curvature[:, 2] if curvature.shape[1] > 2 else np.zeros(curvature.shape[0])
+    else:
+        ncols = len(ycen)
+        p1 = np.zeros(ncols)
+        p2 = np.zeros(ncols)
+
+    sp, sl, model, unc, mask, info = cwrappers.slitfunc_curved(
+        img,
+        ycen,
+        p1,
+        p2,
+        lambda_sp,
+        lambda_sf,
+        osample,
+        yrange,
+        maxiter=maxiter,
+        gain=gain,
+        reject_threshold=reject_threshold,
+        preset_slitfunc=preset_slitfunc,
+    )
+
+    return sp, sl, model, unc, mask, info
+
+
+def _ensure_slitcurve(curvature, ncols, n_coeffs=6):
+    """Ensure curvature is in the right format for charslit.
+
+    Parameters
+    ----------
+    curvature : array[ncols, n_coeffs] or None
+        Curvature coefficients for this trace/swath, or None for vertical extraction.
+    ncols : int
+        Number of columns (for validation/creation if None).
+    n_coeffs : int
+        Number of coefficients (default 6 for charslit).
+
+    Returns
+    -------
+    slitcurve : array[ncols, n_coeffs]
+        Polynomial coefficients padded to n_coeffs.
+    """
+    if curvature is None:
+        return np.zeros((ncols, n_coeffs), dtype=np.float64)
+
+    curvature = np.asarray(curvature, dtype=np.float64)
+    if curvature.shape[1] >= n_coeffs:
+        return curvature[:, :n_coeffs]
+
+    # Pad with zeros
+    result = np.zeros((ncols, n_coeffs), dtype=np.float64)
+    result[:, : curvature.shape[1]] = curvature
+    return result
 
 
 class ProgressPlot:  # pragma: no cover
@@ -119,6 +340,8 @@ class ProgressPlot:  # pragma: no cover
 
         self.paused = False
         self.advance_one = False
+        self.closed = False
+        self.fig.canvas.mpl_connect("close_event", self._on_close)
         ax_slower = self.fig.add_axes([0.30, 0.02, 0.08, 0.04])
         ax_faster = self.fig.add_axes([0.39, 0.02, 0.08, 0.04])
         ax_pause = self.fig.add_axes([0.48, 0.02, 0.08, 0.04])
@@ -151,8 +374,14 @@ class ProgressPlot:  # pragma: no cover
         if self.paused:
             self.advance_one = True
 
+    def _on_close(self, event=None):
+        self.closed = True
+        self.paused = False
+
     def wait_if_paused(self):
         while self.paused and not self.advance_one:
+            if self.closed:
+                break
             self.fig.canvas.flush_events()
             time.sleep(0.05)
         self.advance_one = False
@@ -173,7 +402,12 @@ class ProgressPlot:  # pragma: no cover
         info=None,
         swath_idx=0,
         save=True,
+        slitcurve=None,
+        slitdeltas=None,
     ):
+        if self.closed:
+            return
+
         # Save swath data to debug directory
         if save:
             outfile = self.save_dir / f"swath_trace{trace_idx}_swath{swath_idx}.npz"
@@ -188,6 +422,8 @@ class ProgressPlot:  # pragma: no cover
                 input_mask=input_mask,
                 output_mask=output_mask,
                 info=info,
+                slitcurve=slitcurve,
+                slitdeltas=slitdeltas,
             )
 
         img = np.copy(img)
@@ -197,11 +433,11 @@ class ProgressPlot:  # pragma: no cover
 
         ny = img.shape[0]
         nspec = img.shape[1]
-        x_spec, y_spec = self.get_spec(img, spec, slitf, ycen)
-        x_slit, y_slit = self.get_slitf(img, spec, slitf, ycen)
+        x_spec, y_spec = self.get_spec(img, spec, slitf, ycen, slitcurve, slitdeltas)
+        x_slit, y_slit = self.get_slitf(img, spec, slitf, ycen, slitcurve, slitdeltas)
         ycen = ycen + ny / 2
 
-        old = np.linspace(-1, ny, len(slitf))
+        old = np.linspace(-1, ny, len(slitf)) + 0.5
 
         # Separate rejected (output_mask=True) and good (output_mask=False) pixels
         rejected = output_mask.ravel()
@@ -292,7 +528,7 @@ class ProgressPlot:  # pragma: no cover
         if not np.isnan(limit):
             self.ax_spec.set_ylim((0, limit))
 
-        self.ax_slit.set_ylim((0, ny - 1))
+        self.ax_slit.set_ylim((0, ny))
         limit = np.nanmax(slitf) * 1.1
         if not np.isnan(limit):
             self.ax_slit.set_xlim((0, limit))
@@ -315,30 +551,61 @@ class ProgressPlot:  # pragma: no cover
         self.wait_if_paused()
 
     def close(self):
+        self.closed = True
         plt.ioff()
         plt.close()
 
-    def get_spec(self, img, spec, slitf, ycen):
+    def get_spec(self, img, spec, slitf, ycen, slitcurve=None, slitdeltas=None):
         """get the spectrum corrected by the slit function"""
         nrow, ncol = img.shape
-        x, y = np.indices(img.shape)
-        ycen = ycen - ycen.astype(int)
+        row_idx, col_idx = np.indices(img.shape)
+        ycen_frac = ycen - ycen.astype(int)
 
-        x = x - ycen + 0.5
+        # Slit position for slit function interpolation
+        slit_pos = row_idx - ycen_frac + 0.5
         old = np.linspace(-1, nrow - 1 + 1, len(slitf))
-        sf = np.interp(x, old, slitf)
+        sf = np.interp(slit_pos, old, slitf)
 
-        x = img / sf
+        # Spectrum contribution: image divided by slit function
+        spec_val = img / sf
 
-        x = x.ravel()
-        y = y.ravel()
-        return y, x
+        # Compute column position, accounting for curvature
+        col_pos = col_idx.astype(float)
+        if slitcurve is not None:
+            # t = offset from trace center within swath
+            # ycen is the full trace center position (ylow + fractional_part)
+            t = row_idx - ycen
+            delta = np.zeros_like(t, dtype=float)
+            for i in range(1, min(6, slitcurve.shape[1])):
+                delta += slitcurve[:, i] * (t**i)
+            if slitdeltas is not None:
+                delta += slitdeltas[:, np.newaxis]
+            col_pos = col_pos - delta
 
-    def get_slitf(self, img, spec, slitf, ycen):
+        return col_pos.ravel(), spec_val.ravel()
+
+    def get_slitf(self, img, spec, slitf, ycen, slitcurve=None, slitdeltas=None):
         """get the slit function"""
-        x = np.indices(img.shape)[0]
-        ycen = ycen - ycen.astype(int)
+        nrow, ncol = img.shape
+        row_idx, col_idx = np.indices(img.shape)
+        ycen_frac = ycen - ycen.astype(int)
 
+        # Slit position for display
+        slit_pos = row_idx - ycen_frac + 1
+
+        # Compute effective column position for spectrum lookup
+        col_eff = col_idx.astype(float)
+        if slitcurve is not None:
+            # t = offset from trace center within swath
+            t = row_idx - ycen
+            delta = np.zeros_like(t, dtype=float)
+            for i in range(1, min(6, slitcurve.shape[1])):
+                delta += slitcurve[:, i] * (t**i)
+            if slitdeltas is not None:
+                delta += slitdeltas[:, np.newaxis]
+            col_eff = col_eff - delta
+
+        # Handle zeros in spectrum
         if np.any(spec == 0):
             i = np.arange(len(spec))
             try:
@@ -347,12 +614,15 @@ class ProgressPlot:  # pragma: no cover
                 )(i)
             except ValueError:
                 spec[spec == 0] = np.median(spec)
-        y = img / spec[None, :]
-        y = y.ravel()
 
-        x = x - ycen + 0.5
-        x = x.ravel()
-        return x, y
+        # Get spectrum value at effective column position (with interpolation)
+        col_indices = np.arange(len(spec))
+        spec_at_col = np.interp(col_eff, col_indices, spec)
+
+        # Slit function contribution: image divided by spectrum
+        slitf_val = img / spec_at_col
+
+        return slit_pos.ravel(), slitf_val.ravel()
 
 
 class Swath:
@@ -421,28 +691,16 @@ def fix_parameters(xwd, cr, traces, nrow, ncol, ntrace, ignore_column_range=Fals
     if xwd is None:
         xwd = 1.0
     if np.isscalar(xwd):
-        # xwd is full extraction height, split evenly above/below trace
-        half = xwd / 2
-        xwd = np.tile([half, half], (ntrace, 1))
+        xwd = np.full(ntrace, xwd)
     else:
         xwd = np.asarray(xwd)
         if xwd.ndim == 1:
-            if len(xwd) == ntrace:
-                # Per-trace heights: each value is full height for one trace
-                xwd = np.array([[h / 2, h / 2] for h in xwd])
-            elif len(xwd) == 2:
-                # Deprecated [below, above] format - convert to full height
-                import warnings
-
-                warnings.warn(
-                    "extraction_height as [below, above] list is deprecated. "
-                    "Use a single value for full extraction height.",
-                    DeprecationWarning,
-                    stacklevel=4,
+            if len(xwd) != ntrace:
+                raise ValueError(
+                    f"extraction_height array length {len(xwd)} doesn't match ntrace {ntrace}"
                 )
-                xwd = np.tile(xwd, (ntrace, 1))
-            else:
-                xwd = np.tile(xwd, (ntrace, 1))
+        else:
+            raise ValueError("extraction_height must be a scalar or 1D array")
 
     if cr is None:
         cr = np.tile([0, ncol], (ntrace, 1))
@@ -497,15 +755,14 @@ def extend_traces(traces, nrow):
 
 
 def fix_extraction_height(xwd, traces, cr, ncol):
-    """Convert fractional extraction width to pixel range.
+    """Convert fractional extraction height to pixel range.
 
-    Internal function that works on [below, above] representation.
-    Fractions (< 1 per side, i.e. < 2 total) are multiplied by trace spacing.
+    Fractions (< 2) are multiplied by the minimum distance to neighboring traces.
 
     Parameters
     ----------
-    xwd : array[ntrace, 2]
-        extraction width as [below, above] per trace
+    xwd : array[ntrace]
+        extraction full height per trace
     traces : array[ntrace, degree]
         trace polynomial coefficients
     cr : array[ntrace, 2]
@@ -515,17 +772,17 @@ def fix_extraction_height(xwd, traces, cr, ncol):
 
     Returns
     -------
-    xwd : array[ntrace, 2]
-        updated extraction width in pixels
+    xwd : array[ntrace]
+        updated extraction full height in pixels
     """
 
-    if not np.all(xwd >= 1):
-        # if extraction width is in relative scale transform to pixel scale
+    if not np.all(xwd >= 2):
         x = np.arange(ncol)
         for i in range(1, len(xwd) - 1):
-            for j in [0, 1]:
-                if xwd[i, j] < 1:
-                    k = i - 1 if j == 0 else i + 1
+            if xwd[i] < 2:
+                # Find minimum distance to neighboring traces
+                min_dist = np.inf
+                for k in [i - 1, i + 1]:
                     left = max(cr[[i, k], 0])
                     right = min(cr[[i, k], 1])
 
@@ -535,8 +792,10 @@ def fix_extraction_height(xwd, traces, cr, ncol):
                         )
 
                     current = np.polyval(traces[i], x[left:right])
-                    below = np.polyval(traces[k], x[left:right])
-                    xwd[i, j] *= np.min(np.abs(current - below))
+                    neighbor = np.polyval(traces[k], x[left:right])
+                    min_dist = min(min_dist, np.min(np.abs(current - neighbor)))
+
+                xwd[i] *= min_dist
 
         xwd[0] = xwd[1]
         xwd[-1] = xwd[-2]
@@ -544,6 +803,57 @@ def fix_extraction_height(xwd, traces, cr, ncol):
     xwd = np.ceil(xwd).astype(int)
 
     return xwd
+
+
+def validate_traces_for_extraction(
+    traces: list[Trace],
+    extraction_height: float | np.ndarray,
+    nrow: int,
+    ncol: int,
+) -> None:
+    """Validate traces and mark invalid ones.
+
+    Checks if each trace's extraction aperture fits within the image bounds.
+    Invalid traces are marked with trace.invalid = "reason".
+
+    Parameters
+    ----------
+    traces : list[Trace]
+        Trace objects to validate. Modified in-place.
+    extraction_height : float or array
+        Extraction height(s) in pixels.
+    nrow : int
+        Number of rows in image.
+    ncol : int
+        Number of columns in image.
+    """
+    ix = np.arange(ncol)
+
+    for i, trace in enumerate(traces):
+        if trace.invalid:
+            continue
+
+        if isinstance(extraction_height, np.ndarray):
+            height = extraction_height[i]
+        elif extraction_height is not None:
+            height = extraction_height
+        else:
+            height = trace.height if trace.height is not None else 0.5
+        half = height / 2
+
+        # Check if extraction aperture stays within image
+        y_cen = np.polyval(trace.pos, ix)
+        y_bot = y_cen - half
+        y_top = y_cen + half
+
+        # Find columns where aperture is fully within image
+        col_start, col_end = trace.column_range
+        valid_cols = np.where((y_bot >= 0) & (y_top < nrow))[0]
+        valid_cols = valid_cols[(valid_cols >= col_start) & (valid_cols < col_end)]
+
+        if len(valid_cols) == 0:
+            trace.invalid = f"extraction height {height:.1f}px exceeds image bounds"
+            logger.warning("Trace %d: %s, marking invalid", i, trace.invalid)
 
 
 def fix_column_range(column_range, traces, extraction_height, nrow, ncol):
@@ -555,8 +865,8 @@ def fix_column_range(column_range, traces, extraction_height, nrow, ncol):
         image
     traces : array[ntrace, degree]
         trace polynomial coefficients
-    extraction_height : array[ntrace, 2]
-        extraction width in pixels, (below, above)
+    extraction_height : array[ntrace]
+        extraction full height in pixels
     column_range : array[ntrace, 2]
         current column range
     no_clip : bool, optional
@@ -572,12 +882,13 @@ def fix_column_range(column_range, traces, extraction_height, nrow, ncol):
 
     ix = np.arange(ncol)
     to_remove = []
+    half = extraction_height / 2
     # Loop over non extension traces
     for i, trace in zip(range(1, len(traces) - 1), traces[1:-1], strict=False):
-        # Shift trace up/down by extraction_height
+        # Shift trace up/down by half extraction_height
         coeff_bot, coeff_top = np.copy(trace), np.copy(trace)
-        coeff_bot[-1] -= extraction_height[i, 0]
-        coeff_top[-1] += extraction_height[i, 1]
+        coeff_bot[-1] -= half[i]
+        coeff_top[-1] += half[i]
 
         y_bot = np.polyval(coeff_bot, ix)  # low edge of arc
         y_top = np.polyval(coeff_top, ix)  # high edge of arc
@@ -746,8 +1057,8 @@ def extract_spectrum(
     scatter=None,
     normalize=False,
     threshold=0,
-    p1=None,
-    p2=None,
+    curvature=None,
+    slitdeltas=None,
     plot=False,
     plot_title=None,
     im_norm=None,
@@ -816,10 +1127,11 @@ def extract_spectrum(
         whether to create a normalized image. If true, im_norm and im_ordr are used as output (default: False)
     threshold : int, optional
         threshold for normalization (default: 0)
-    p1 : array[ncol], optional
-        The 1st order curvature of the slit in this order for the curved extraction (default: None, i.e. p1 = 0)
-    p2 : array[ncol], optional
-        The 2nd order curvature of the slit in this order for the curved extraction (default: None, i.e. p2 = 0)
+    curvature : array[ncol, n_coeffs], optional
+        Slit curvature polynomial coefficients for this trace (default: None, i.e. vertical extraction)
+    slitdeltas : array[nrows_stored], optional
+        Per-row residual offsets from polynomial curvature fit (default: None).
+        Will be interpolated to match swath nrows if lengths differ.
     plot : bool, optional
         wether to plot the progress, plotting will slow down the procedure significantly (default: False)
     ord_num : int, optional
@@ -854,6 +1166,14 @@ def extract_spectrum(
             f"Ensure norm_flat and extraction use the same extraction_height and osample."
         )
 
+    # CFFI backend only supports curvature degree <= 2; truncate if needed
+    if not USE_CHARSLIT and curvature is not None and curvature.shape[1] > 3:
+        logger.warning(
+            "curve_degree > 2 requires charslit backend. "
+            "Truncating to degree 2. Set PYREDUCE_USE_CHARSLIT=1 for full curvature support."
+        )
+        curvature = curvature[:, :3]
+
     ycen_int = np.floor(ycen).astype(int)
 
     spec = np.zeros(ncol) if out_spec is None else out_spec
@@ -884,7 +1204,11 @@ def extract_spectrum(
             # Cut out swath from image
             index = make_index(ycen_int - ylow, ycen_int + yhigh, ibeg, iend)
             swath_img = img[index]
-            swath_ycen = ycen[ibeg:iend]
+            # Convert ycen to swath-relative coordinates
+            # The swath is cut from ycen_int - ylow, so within the swath:
+            # trace center = ylow + fractional_part(ycen)
+            swath_ycen_abs = ycen[ibeg:iend]
+            swath_ycen = ylow + (swath_ycen_abs - np.floor(swath_ycen_abs))
 
             # Corrections
             # TODO: what is it even supposed to do?
@@ -901,23 +1225,59 @@ def extract_spectrum(
             swath_img -= scatter_correction + telluric_correction
 
             # Do Slitfunction extraction
-            swath_p1 = p1[ibeg:iend] if p1 is not None else 0
-            swath_p2 = p2[ibeg:iend] if p2 is not None else 0
+            swath_ncols = iend - ibeg
+            swath_nrows = swath_img.shape[0]
+            swath_curv = curvature[ibeg:iend] if curvature is not None else None
             input_mask = np.ma.getmaskarray(swath_img).copy()
-            swath[ihalf] = slitfunc_curved(
-                swath_img,
-                swath_ycen,
-                swath_p1,
-                swath_p2,
-                lambda_sp=lambda_sp,
-                lambda_sf=lambda_sf,
-                osample=osample,
-                yrange=yrange,
-                maxiter=maxiter,
-                gain=gain,
-                reject_threshold=reject_threshold,
-                preset_slitfunc=preset_slitfunc,
-            )
+
+            # Prepare curvature for both backends and visualization
+            slitcurve = _ensure_slitcurve(swath_curv, swath_ncols)
+            if USE_DELTAS and slitdeltas is not None and len(slitdeltas) > 0:
+                # Interpolate slitdeltas to match swath nrows if needed
+                if len(slitdeltas) == swath_nrows:
+                    swath_slitdeltas = slitdeltas.astype(np.float64)
+                else:
+                    x_stored = np.linspace(0, 1, len(slitdeltas))
+                    x_swath = np.linspace(0, 1, swath_nrows)
+                    swath_slitdeltas = np.interp(x_swath, x_stored, slitdeltas)
+                    swath_slitdeltas = swath_slitdeltas.astype(np.float64)
+            else:
+                swath_slitdeltas = None
+
+            if USE_CHARSLIT:
+                charslit_slitdeltas = (
+                    swath_slitdeltas
+                    if swath_slitdeltas is not None
+                    else np.zeros(swath_nrows, dtype=np.float64)
+                )
+                swath[ihalf] = _slitdec_charslit(
+                    swath_img,
+                    swath_ycen_abs,
+                    slitcurve,
+                    charslit_slitdeltas,
+                    lambda_sp=lambda_sp,
+                    lambda_sf=lambda_sf,
+                    osample=osample,
+                    yrange=yrange,
+                    maxiter=maxiter,
+                    gain=gain,
+                    reject_threshold=reject_threshold,
+                    preset_slitfunc=preset_slitfunc,
+                )
+            else:
+                swath[ihalf] = _slitdec_cffi(
+                    swath_img,
+                    swath_ycen_abs,
+                    swath_curv,
+                    lambda_sp=lambda_sp,
+                    lambda_sf=lambda_sf,
+                    osample=osample,
+                    yrange=yrange,
+                    maxiter=maxiter,
+                    gain=gain,
+                    reject_threshold=reject_threshold,
+                    preset_slitfunc=preset_slitfunc,
+                )
             t.set_postfix(chi=f"{swath[ihalf][5][1]:1.2f}")
 
             if normalize:
@@ -956,6 +1316,8 @@ def extract_spectrum(
                     swath.unc[ihalf],
                     swath.info[ihalf],
                     ihalf,
+                    slitcurve=slitcurve,
+                    slitdeltas=swath_slitdeltas,
                 )
 
     # Remove points at the border of the each swath, if order has curvature
@@ -1018,8 +1380,7 @@ def model(spec, slitf):
 
 
 def get_y_scale(ycen, xrange, extraction_height, nrow):
-    """Calculate the y limits of the order
-    This is especially important at the edges
+    """Calculate the y limits of the order for C extraction code.
 
     Parameters
     ----------
@@ -1027,35 +1388,40 @@ def get_y_scale(ycen, xrange, extraction_height, nrow):
         order trace
     xrange : tuple(int, int)
         column range
-    extraction_height : tuple(int, int)
-        extraction width in pixels below and above the order
+    extraction_height : int
+        extraction full height in pixels
     nrow : int
         number of rows in the image, defines upper edge
 
     Returns
     -------
-    y_low, y_high : int, int
-        lower and upper y bound for extraction
+    ylow, yhigh : int, int
+        lower and upper y bound for extraction (pixels below/above trace)
+        These satisfy: ylow + yhigh + 1 = extraction_height
     """
-    ycen = ycen[xrange[0] : xrange[1]]
+    ycen = ycen[xrange[0] : xrange[1]].copy()
+    half = extraction_height // 2
 
-    ymin = ycen - extraction_height[0]
-    ymin = np.floor(ymin)
+    if extraction_height % 2 == 0:
+        ycen += 1
+    else:
+        ycen += 0.5
+    ymin = np.floor(ycen - half).astype(int)
+
     if min(ymin) < 0:
         ymin = ymin - min(ymin)  # help for orders at edge
     if max(ymin) >= nrow:
         ymin = ymin - max(ymin) + nrow - 1  # helps at edge
 
-    ymax = ycen + extraction_height[1]
-    ymax = np.ceil(ymax)
+    ymax = ymin + extraction_height - 1
     if max(ymax) >= nrow:
         ymax = ymax - max(ymax) + nrow - 1  # helps at edge
+        ymin = ymax - extraction_height + 1
 
-    # Define a fixed height area containing one spectral order
-    y_lower_lim = int(np.min(ycen - ymin))  # Pixels below center line
-    y_upper_lim = int(np.min(ymax - ycen))  # Pixels above center line
+    ylow = int(np.min(ycen - ymin))  # Pixels below center line
+    yhigh = extraction_height - 1 - ylow  # Guarantee total = extraction_height
 
-    return y_lower_lim, y_upper_lim
+    return ylow, yhigh
 
 
 def optimal_extraction(
@@ -1063,8 +1429,8 @@ def optimal_extraction(
     traces,
     extraction_height,
     column_range,
-    p1,
-    p2,
+    curvature=None,
+    slitdeltas=None,
     plot=False,
     plot_title=None,
     **kwargs,
@@ -1079,12 +1445,14 @@ def optimal_extraction(
         image to extract
     traces : array[ntrace, degree]
         trace polynomial coefficients
-    extraction_height : array[ntrace, 2]
-        extraction width in pixels
+    extraction_height : array[ntrace]
+        extraction full height in pixels
     column_range : array[ntrace, 2]
         column range to use
-    scatter : array[ntrace, 4, ncol]
-        background scatter (or None)
+    curvature : array[ntrace, ncol, n_coeffs] or None
+        Slit curvature polynomial coefficients (default: None for vertical extraction)
+    slitdeltas : array[ntrace, nrows] or None
+        Per-row residual offsets from curvature fit (default: None)
     **kwargs
         other parameters for the extraction (see extract_spectrum)
 
@@ -1107,11 +1475,6 @@ def optimal_extraction(
     uncertainties = np.zeros((ntrace, ncol))
     slitfunction = [None for _ in range(ntrace)]
 
-    if p1 is None:
-        p1 = [None for _ in range(ntrace)]
-    if p2 is None:
-        p2 = [None for _ in range(ntrace)]
-
     # Handle preset_slitfunc (list of per-trace slitfuncs)
     preset_slitfunc = kwargs.pop("preset_slitfunc", None)
 
@@ -1125,7 +1488,7 @@ def optimal_extraction(
     ix = np.arange(ncol)
     if plot >= 2 and util.is_interactive_plot_mode():  # pragma: no cover
         ncol_swath = kwargs.get("swath_width", img.shape[1] // 400)
-        nrow_swath = np.sum(extraction_height, axis=1).max()
+        nrow_swath = np.max(extraction_height)
         nslitf_swath = (nrow_swath + 2) * kwargs.get("osample", 1) + 1
         progress = ProgressPlot(nrow_swath, ncol_swath, nslitf_swath, title=plot_title)
     else:
@@ -1137,6 +1500,10 @@ def optimal_extraction(
         # Define a fixed height area containing one trace
         ycen = np.polyval(traces[i], ix)
         yrange = get_y_scale(ycen, column_range[i], extraction_height[i], nrow)
+        # Shift ycen so floor() rounds to nearest integer, centering the trace
+        # in the extraction window (sub-pixel offset near 0 instead of biased to +1)
+        cr = column_range[i]
+        ycen[cr[0] : cr[1]] += 0.5 if extraction_height[i] % 2 == 1 else 1
 
         osample = kwargs.get("osample", 1)
         slitfunction[i] = np.zeros(osample * (sum(yrange) + 2) + 1)
@@ -1147,13 +1514,15 @@ def optimal_extraction(
         order_slitfunc = None
         if preset_slitfunc is not None and i < len(preset_slitfunc):
             order_slitfunc = preset_slitfunc[i]
+        trace_curv = curvature[i] if curvature is not None else None
+        trace_slitdeltas = slitdeltas[i] if slitdeltas is not None else None
         extract_spectrum(
             img,
             ycen,
             yrange,
             column_range[i],
-            p1=p1[i],
-            p2=p2[i],
+            curvature=trace_curv,
+            slitdeltas=trace_slitdeltas,
             out_spec=spectrum[i],
             out_sunc=uncertainties[i],
             out_slitf=slitfunction[i],
@@ -1183,13 +1552,36 @@ def optimal_extraction(
     return spectrum, slitfunction, uncertainties
 
 
-def correct_for_curvature(img_order, p1, p2, xwd):
-    # img_order = np.ma.filled(img_order, np.nan)
+def correct_for_curvature(img_order, curvature, xwd, inverse=False):
+    """Correct image for slit curvature by interpolation.
+
+    Parameters
+    ----------
+    img_order : array[nrow, ncol]
+        Image swath to correct
+    curvature : array[ncol, n_coeffs]
+        Curvature coefficients [c0, c1, c2, ...] where dx = c1*y + c2*y^2 + ...
+    xwd : int
+        Extraction full height in pixels
+    inverse : bool
+        If True, apply inverse correction (for model reapplication)
+
+    Returns
+    -------
+    img_order : array
+        Corrected image
+    """
     mask = ~np.ma.getmaskarray(img_order)
+    sign = -1 if inverse else 1
+    half = xwd // 2
 
     xt = np.arange(img_order.shape[1])
-    for y, yt in zip(range(xwd[0] + xwd[1]), range(-xwd[0], xwd[1]), strict=False):
-        xi = xt + yt * p1 + yt**2 * p2
+    for y, yt in zip(range(xwd), range(-half, xwd - half), strict=False):
+        # Compute displacement: dx = c1*y + c2*y^2 + c3*y^3 + ...
+        dx = np.zeros(img_order.shape[1])
+        for k in range(1, curvature.shape[1]):
+            dx += curvature[:, k] * (yt**k)
+        xi = xt + sign * dx
         img_order[y] = np.interp(
             xi, xt[mask[y]], img_order[y][mask[y]], left=0, right=0
         )
@@ -1203,22 +1595,6 @@ def correct_for_curvature(img_order, p1, p2, xwd):
     return img_order
 
 
-def model_image(img, xwd, p1, p2):
-    # Correct image for curvature
-    img.shape[0]
-    img = correct_for_curvature(img, p1, p2, xwd)
-    # Find slitfunction using the median to avoid outliers
-    slitf = np.ma.median(img, axis=1)
-    slitf /= np.ma.sum(slitf)
-    # Use the slitfunction to find spectrum
-    spec = np.ma.median(img / slitf[:, None], axis=0)
-    # Create model from slitfunction and spectrum
-    model = spec[None, :] * slitf[:, None]
-    # Reapply curvature to the model
-    model = correct_for_curvature(model, -p1, -p2, xwd)
-    return model, spec, slitf
-
-
 def simple_extraction(
     img,
     traces,
@@ -1229,8 +1605,7 @@ def simple_extraction(
     dark=0,
     plot=False,
     plot_title=None,
-    p1=None,
-    p2=None,
+    curvature=None,
     collapse_function="median",
     **kwargs,
 ):
@@ -1246,8 +1621,8 @@ def simple_extraction(
         image to extract
     traces : array[ntrace, degree]
         trace polynomial coefficients
-    extraction_height : array[ntrace, 2]
-        extraction width in pixels
+    extraction_height : array[ntrace]
+        extraction full height in pixels
     column_range : array[ntrace, 2]
         column range to use
     gain : float, optional
@@ -1292,19 +1667,20 @@ def simple_extraction(
         # Rectify the image, i.e. remove the shape of the trace
         # Then the center of the trace is within one pixel variations
         ycen = np.polyval(traces[i], x).astype(int)
-        yb, yt = ycen - extraction_height[i, 0], ycen + extraction_height[i, 1]
-        extraction_height[i, 0] + extraction_height[i, 1] + 1
+        half = extraction_height[i] // 2
+        yb = ycen - half
+        yt = yb + extraction_height[i] - 1
         index = make_index(yb, yt, x_left_lim, x_right_lim)
         img_trace = img[index]
 
-        # Correct for curvature (p1 and p2)
+        # Correct for curvature
         # For each row of the rectified trace, interpolate onto the shifted row
         # Masked pixels are set to 0, similar to the summation
-        if p1 is not None and p2 is not None:
+        if curvature is not None:
+            trace_curv = curvature[i, x_left_lim:x_right_lim]
             img_trace = correct_for_curvature(
                 img_trace,
-                p1[i, x_left_lim:x_right_lim],
-                p2[i, x_left_lim:x_right_lim],
+                trace_curv,
                 extraction_height[i],
             )
 
@@ -1351,8 +1727,9 @@ def plot_comparison(
     x = np.arange(ncol)
     for i in range(ntrace):
         ycen = np.polyval(traces[i], x)
-        yb = ycen - extraction_height[i, 0]
-        yt = ycen + extraction_height[i, 1]
+        half = extraction_height[i] // 2
+        yb = ycen - half
+        yt = yb + extraction_height[i] - 1
         xl, xr = column_range[i]
         index = make_index(yb, yt, xl, xr)
         yl = pos[i]
@@ -1383,7 +1760,7 @@ def plot_comparison(
         except:
             pass
 
-    locs = np.sum(extraction_height, axis=1) + 1
+    locs = np.asarray(extraction_height) + 1
     locs = np.array([0, *np.cumsum(locs)[:-1]])
     locs[:-1] += (np.diff(locs) * 0.5).astype(int)
     locs[-1] += ((output.shape[0] - locs[-1]) * 0.5).astype(int)
@@ -1400,128 +1777,252 @@ def plot_comparison(
 
 def extract(
     img,
-    traces,
-    column_range=None,
-    trace_range=None,
-    extraction_height=0.5,
-    extraction_type="optimal",
-    p1=None,
-    p2=None,
+    traces: list[Trace],
+    extraction_height: float = 0.5,
+    extraction_type: str = "optimal",
     **kwargs,
-):
+) -> list[Spectrum]:
     """
-    Extract the spectrum from an image
+    Extract spectra from an image.
 
     Parameters
     ----------
     img : array[nrow, ncol](float)
-        observation to extract
-    traces : array[ntrace, degree](float)
-        polynomial coefficients of the trace positions
-    column_range : array[ntrace, 2](int), optional
-        range of pixels to use for each trace (default: use all)
-    trace_range : array[2](int), optional
-        range of traces to extract, traces have to be consecutive (default: use all)
+        Observation to extract.
+    traces : list[Trace]
+        Trace objects with position, column_range, and optional slit curvature.
     extraction_height : float, optional
-        Total extraction height. Values below 3 are fractions of trace spacing, values above are pixels. Split evenly above/below trace. (default: 1.0)
-    extraction_type : {"optimal", "simple", "normalize"}, optional
-        which extraction algorithm to use, "optimal" uses optimal extraction, "simple" uses simple sum/median extraction, and "normalize" also uses optimal extraction, but returns the normalized image (default: "optimal")
-    p1 : float or array[ntrace, ncol], optional
-        The 1st order curvature of the slit for curved extraction. Will use vertical extraction if not set. (default: None, i.e. p1 = 0)
-    p2 : float or array[ntrace, ncol], optional
-        The 2nd order curvature of the slit for curved extraction (default: None, i.e. p2 = 0)
-    polarization : bool, optional
-        if true, pairs of traces are considered to belong to the same order, but different polarization. Only affects the scatter (default: False)
-    **kwargs, optional
-        parameters for extraction functions
+        Extraction height. Values below 2 are fractions of trace spacing,
+        values above are pixels. If None, falls back to trace.height. (default: 0.5)
+    extraction_type : {"optimal", "simple"}, optional
+        Extraction algorithm. (default: "optimal")
+    **kwargs
+        Additional parameters for extraction functions (osample, lambda_sf, etc.)
 
     Returns
     -------
-    spec : array[ntrace, ncol](float)
-        extracted spectrum for each trace
-    uncertainties : array[ntrace, ncol](float)
-        uncertainties on the spectrum
-
-    if extraction_type == "normalize" instead return
-
-    im_norm : array[nrow, ncol](float)
-        normalized image
-    im_ordr : array[nrow, ncol](float)
-        image with just the traces
-    blaze : array[ntrace, ncol](float)
-        extracted spectrum (equals blaze if img was the flat field)
+    list[Spectrum]
+        Extracted spectrum objects, one per trace.
     """
+    if len(traces) == 0:
+        return []
 
     nrow, ncol = img.shape
-    ntrace, _ = traces.shape
-    if trace_range is None:
-        trace_range = (0, ntrace)
-    if np.isscalar(p1):
-        n = trace_range[1] - trace_range[0]
-        p1 = np.full((n, ncol), p1)
-    if np.isscalar(p2):
-        n = trace_range[1] - trace_range[0]
-        p2 = np.full((n, ncol), p2)
+
+    # Validate traces and mark invalid ones
+    validate_traces_for_extraction(traces, extraction_height, nrow, ncol)
+
+    # Filter to valid traces only
+    valid_traces = [t for t in traces if not t.invalid]
+    if len(valid_traces) == 0:
+        logger.warning("No valid traces remaining after validation")
+        return []
+
+    ntrace = len(valid_traces)
+
+    # Convert Trace objects to arrays for internal processing
+    traces_arr = np.array([t.pos for t in valid_traces])
+    column_range = np.array(
+        [list(t.column_range) for t in valid_traces], dtype=np.int32
+    )
+
+    # Settings value takes precedence; fall back to trace.height when None
+    if extraction_height is not None:
+        heights = np.full(ntrace, extraction_height)
+    else:
+        heights = np.array(
+            [t.height if t.height is not None else 0.5 for t in valid_traces]
+        )
+
+    # Build curvature arrays from Trace.slit
+    curvature = None
+    if any(t.slit is not None for t in valid_traces):
+        # Get max slit dimensions
+        max_y = max(
+            (t.slit.shape[0] if t.slit is not None else 0) for t in valid_traces
+        )
+        max_x = max(
+            (t.slit.shape[1] if t.slit is not None else 0) for t in valid_traces
+        )
+        if max_y > 0 and max_x > 0:
+            curvature = np.zeros((ntrace, ncol, max_y), dtype=np.float64)
+            for i, t in enumerate(valid_traces):
+                if t.slit is not None:
+                    # Evaluate slit polynomial at each column
+                    for j in range(ncol):
+                        coeffs = t.slit_at_x(j)
+                        if coeffs is not None:
+                            curvature[i, j, : len(coeffs)] = coeffs
+
+    # Build slitdeltas array from Trace.slitdelta
+    slitdeltas = None
+    if any(t.slitdelta is not None for t in valid_traces):
+        max_len = max(
+            (len(t.slitdelta) if t.slitdelta is not None else 0) for t in valid_traces
+        )
+        if max_len > 0:
+            slitdeltas = np.zeros((ntrace, max_len), dtype=np.float32)
+            for i, t in enumerate(valid_traces):
+                if t.slitdelta is not None:
+                    slitdeltas[i, : len(t.slitdelta)] = t.slitdelta
 
     # Fix the input parameters
-    extraction_height, column_range, traces = fix_parameters(
-        extraction_height, column_range, traces, nrow, ncol, ntrace
+    heights, column_range, traces_arr = fix_parameters(
+        heights, column_range, traces_arr, nrow, ncol, ntrace
     )
-    # Limit traces (and related properties) to traces in range
-    ntrace = trace_range[1] - trace_range[0]
-    traces = traces[trace_range[0] : trace_range[1]]
-    column_range = column_range[trace_range[0] : trace_range[1]]
-    extraction_height = extraction_height[trace_range[0] : trace_range[1]]
 
+    # Perform extraction
     if extraction_type == "optimal":
-        # the "normal" case, except for wavelength calibration files
         spectrum, slitfunction, uncertainties = optimal_extraction(
             img,
-            traces,
-            extraction_height,
+            traces_arr,
+            heights,
             column_range,
-            p1=p1,
-            p2=p2,
+            curvature=curvature,
+            slitdeltas=slitdeltas,
             **kwargs,
         )
-    elif extraction_type == "normalize":
-        # TODO
-        # Prepare normalized flat field image if necessary
-        # These will be passed and "returned" by reference
-        # I dont like it, but it works for now
-        im_norm = np.zeros_like(img)
-        im_ordr = np.zeros_like(img)
-
-        blaze, slitfunction, _ = optimal_extraction(
-            img,
-            traces,
-            extraction_height,
-            column_range,
-            p1=p1,
-            p2=p2,
-            normalize=True,
-            im_norm=im_norm,
-            im_ordr=im_ordr,
-            **kwargs,
-        )
-        threshold_lower = kwargs.get("threshold_lower", 0)
-        im_norm[im_norm <= threshold_lower] = 1
-        im_ordr[im_ordr <= threshold_lower] = 1
-        return im_norm, im_ordr, blaze, slitfunction, column_range
-    elif extraction_type in ("simple", "arc"):  # "arc" for backwards compatibility
+    elif extraction_type in ("simple", "arc"):
         spectrum, uncertainties = simple_extraction(
             img,
-            traces,
-            extraction_height,
+            traces_arr,
+            heights,
             column_range,
-            p1=p1,
-            p2=p2,
+            curvature=curvature,
             **kwargs,
         )
-        slitfunction = None
+        slitfunction = [None] * ntrace
     else:
         raise ValueError(
-            f"Parameter 'extraction_type' not understood. Expected 'optimal', 'normalize', or 'simple' but got {extraction_type}."
+            f"extraction_type must be 'optimal' or 'simple', got {extraction_type}"
         )
 
-    return spectrum, uncertainties, slitfunction, column_range
+    # Convert results to Spectrum objects
+    results = []
+    for i, trace in enumerate(valid_traces):
+        # Convert masked array to NaN-masked regular array
+        spec_1d = np.ma.filled(spectrum[i], np.nan)
+        unc_1d = np.ma.filled(uncertainties[i], np.nan)
+        slitfu = slitfunction[i] if slitfunction else None
+
+        # Evaluate wavelength from trace polynomial if available
+        wave = trace.wlen(np.arange(len(spec_1d)))
+
+        results.append(
+            Spectrum.from_trace(
+                trace,
+                spec_1d,
+                unc_1d,
+                wave=wave,
+                slitfu=slitfu,
+                extraction_height=heights[i],
+            )
+        )
+
+    return results
+
+
+def extract_normalize(
+    img,
+    traces: list[Trace],
+    extraction_height: float = 0.5,
+    **kwargs,
+):
+    """
+    Extract and normalize flat field image.
+
+    This is a specialized extraction mode for flat field processing that
+    returns normalized images rather than Spectrum objects.
+
+    Parameters
+    ----------
+    img : array[nrow, ncol](float)
+        Flat field image to normalize.
+    traces : list[Trace]
+        Trace objects with position, column_range, height, slit curvature.
+    extraction_height : float, optional
+        Extraction height. If None, falls back to trace.height.
+    **kwargs
+        Additional parameters for extraction.
+
+    Returns
+    -------
+    im_norm : array[nrow, ncol](float)
+        Normalized flat field image.
+    im_ordr : array[nrow, ncol](float)
+        Image with just the trace regions.
+    blaze : array[ntrace, ncol](float)
+        Extracted blaze function.
+    slitfunction : list
+        Recovered slit functions.
+    column_range : array[ntrace, 2](int)
+        Column ranges used.
+    """
+    if not traces:
+        raise ValueError("No traces provided")
+
+    nrow, ncol = img.shape
+    ntrace = len(traces)
+
+    # Convert Trace objects to arrays
+    traces_arr = np.array([t.pos for t in traces])
+    column_range = np.array([list(t.column_range) for t in traces], dtype=np.int32)
+    # Settings value takes precedence; fall back to trace.height when None
+    if extraction_height is not None:
+        heights = np.full(ntrace, extraction_height)
+    else:
+        heights = np.array([t.height if t.height is not None else 0.5 for t in traces])
+
+    # Build curvature arrays
+    curvature = None
+    if any(t.slit is not None for t in traces):
+        max_y = max((t.slit.shape[0] if t.slit is not None else 0) for t in traces)
+        max_x = max((t.slit.shape[1] if t.slit is not None else 0) for t in traces)
+        if max_y > 0 and max_x > 0:
+            curvature = np.zeros((ntrace, ncol, max_y), dtype=np.float64)
+            for i, t in enumerate(traces):
+                if t.slit is not None:
+                    for j in range(ncol):
+                        coeffs = t.slit_at_x(j)
+                        if coeffs is not None:
+                            curvature[i, j, : len(coeffs)] = coeffs
+
+    # Build slitdeltas array
+    slitdeltas = None
+    if any(t.slitdelta is not None for t in traces):
+        max_len = max(
+            (len(t.slitdelta) if t.slitdelta is not None else 0) for t in traces
+        )
+        if max_len > 0:
+            slitdeltas = np.zeros((ntrace, max_len), dtype=np.float32)
+            for i, t in enumerate(traces):
+                if t.slitdelta is not None:
+                    slitdeltas[i, : len(t.slitdelta)] = t.slitdelta
+
+    # Fix parameters
+    heights, column_range, traces_arr = fix_parameters(
+        heights, column_range, traces_arr, nrow, ncol, ntrace
+    )
+
+    # Prepare output images
+    im_norm = np.zeros_like(img)
+    im_ordr = np.zeros_like(img)
+
+    blaze, slitfunction, _ = optimal_extraction(
+        img,
+        traces_arr,
+        heights,
+        column_range,
+        curvature=curvature,
+        slitdeltas=slitdeltas,
+        normalize=True,
+        im_norm=im_norm,
+        im_ordr=im_ordr,
+        **kwargs,
+    )
+
+    threshold_lower = kwargs.get("threshold_lower", 0)
+    im_norm[im_norm <= threshold_lower] = 1
+    im_ordr[im_ordr <= threshold_lower] = 1
+
+    return im_norm, im_ordr, blaze, slitfunction, column_range

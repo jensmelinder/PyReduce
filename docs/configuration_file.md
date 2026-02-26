@@ -31,53 +31,60 @@ extraction parameters, etc.
 }
 ```
 
-Settings are loaded in order:
+### Settings Cascade
 
-1. `instruments/defaults/settings.json` - Base defaults
-2. `instruments/{INSTRUMENT}/settings.json` - Instrument-specific overrides
-3. Runtime overrides via `configuration` parameter
+Settings are resolved by merging files in order, with later levels overriding earlier ones:
+
+1. `instruments/defaults/settings.json` — base defaults
+2. `instruments/{INSTRUMENT}/settings.json` — instrument-specific overrides
+3. `instruments/{INSTRUMENT}/settings_{channel}.json` — per-channel overrides (if channel is specified and the file exists)
+4. Runtime overrides via `configuration` parameter or keyword arguments
+
+Each file only needs to specify the values it wants to change. Missing keys are inherited from the parent file.
+
+### Inheritance (`__inherits__`)
+
+Every settings file (except `defaults/settings.json`) declares its parent via `__inherits__`:
+
+```json
+{
+    "__inherits__": "ANDES_RIZ/settings.json",
+    "curvature": {
+        "curve_height": 171,
+        "extraction_height": 20
+    }
+}
+```
+
+The path is relative to `pyreduce/instruments/`. Inheritance is resolved recursively — a per-channel file inherits from the instrument file, which inherits from defaults.
+
+You can also inherit from another channel's settings to avoid duplication. For example, MOSAIC VIS2-VIS4 inherit from VIS1:
+
+```json
+{
+    "__inherits__": "MOSAIC/settings_VIS1.json"
+}
+```
 
 ### Per-Channel Settings
 
-For instruments with multiple channels that need different parameters, you can
-create channel-specific settings files named `settings_{channel}.json`:
+Instruments with multiple channels often need different parameters (extraction heights, curvature settings, etc.). Create `settings_{channel}.json` files alongside `settings.json`:
 
 ```
-pyreduce/instruments/MOSAIC/
-    settings.json           # Base settings for all channels
-    settings_NIR1.json      # Overrides for NIR1 channel
-    settings_VIS1.json      # Overrides for VIS1 channel
+pyreduce/instruments/ANDES_RIZ/
+    settings.json           # Shared settings for all ANDES_RIZ channels
+    settings_r.json         # Overrides for R channel
+    settings_iz.json        # Overrides for IZ channel
 ```
 
-Channel settings should inherit from the base instrument using explicit paths:
+When you pass `channel=` to the pipeline, the per-channel file is loaded automatically:
 
-```json
-{
-    "__instrument__": "MOSAIC",
-    "__inherits__": "MOSAIC/settings.json",
-    "science": {
-        "extraction_height": 50
-    }
-}
+```python
+Pipeline.from_instrument("ANDES_RIZ", channel="r", ...)  # loads settings_r.json
+Pipeline.from_instrument("ANDES_RIZ", ...)                # loads settings.json
 ```
 
-You can also inherit from another channel's settings to avoid duplication:
-
-```json
-{
-    "__instrument__": "MOSAIC",
-    "__inherits__": "MOSAIC/settings_VIS1.json",
-    "trace": {
-        "closing_shape": [1, 50]
-    }
-}
-```
-
-The `__inherits__` path is relative to `pyreduce/instruments/`. Use `"defaults/settings.json"` to inherit only from the base defaults.
-
-When using `Pipeline.from_instrument(..., channel="NIR1")`, PyReduce will
-automatically load `settings_NIR1.json` if it exists, falling back to
-`settings.json` otherwise.
+If `settings_{channel}.json` doesn't exist, it falls back to `settings.json`.
 
 To override settings at runtime:
 
@@ -164,7 +171,7 @@ Use either `noise` (absolute threshold) or `noise_relative` (e.g., 0.01 for 1% o
 
 The extraction aperture can be specified as:
 
-- **`null`** (default) - Use per-trace heights computed during tracing, stored in `traces.npz`. This provides optimal apertures based on actual trace spacing.
+- **`null`** (default) - Use per-trace heights computed during tracing, stored in `traces.fits`. This provides optimal apertures based on actual trace spacing.
 - **Pixels** (≥2) - Explicit pixel height, e.g., `20` for 20 pixels total (10 above, 10 below trace)
 - **Fraction** (<2) - Fraction of order separation, e.g., `0.5` for half the distance to neighbors
 
@@ -172,16 +179,25 @@ The automatic heights (null) are recommended for most cases. They adapt to varyi
 
 #### Using a Pre-computed Slit Function
 
-For faster extraction, the slit function computed during `norm_flat` can be reused in subsequent steps. The normalized flat step saves the slit function to `.slitfunc.npz` with metadata (extraction_height, osample). To use it:
+For faster extraction, the slit function computed during `norm_flat` can be reused in subsequent steps. The normalized flat step saves the slit function to `.flat_norm.npz` with metadata (extraction_height, osample). To use it:
 
 ```python
-from pyreduce.echelle import read
+import numpy as np
+from pyreduce.extract import extract
 
 # Load slit function from norm_flat output
-slitfunc_data = read("output/UVES.2010-04-01.slitfunc.npz")
+norm_data = np.load("output/uves.flat_norm.npz", allow_pickle=True)
+slitfunc_list = list(norm_data["slitfunc"])
+slitfunc_meta = norm_data["slitfunc_meta"].item()
 
-# Pass to science extraction
-pipe.science(science_files, preset_slitfunc=slitfunc_data["slitfunc"])
+# Extract with preset slit function
+spectra = extract(
+    image,
+    traces,
+    extraction_height=slitfunc_meta["extraction_height"],
+    osample=slitfunc_meta["osample"],
+    preset_slitfunc=slitfunc_list,
+)
 ```
 
 This performs single-pass extraction without iterating to find the slit function shape, which is useful for instruments with stable slit profiles.
@@ -194,6 +210,48 @@ This performs single-pass extraction without iterating to find the slit function
 | `threshold` | Line detection threshold | 100 |
 | `iterations` | Refinement iterations | 3 |
 | `medium` | Refractive medium ("air" or "vacuum") | "air" |
+| `dimensionality` | "1D" (per-trace) or "2D" (shared polynomial) | "2D" |
+| `atlas` | Line atlas name ("thar", "une", "lfc", etc.) | "thar" |
+
+#### Per-Group Wavelength Calibration
+
+For multi-fiber instruments, wavelength calibration can process fiber groups
+separately. This is configured via `fibers.use.wavecal` in `config.yaml`:
+
+```yaml
+fibers:
+  groups:
+    A: {range: [1, 36], merge: average}
+    cal: {range: [37, 40], merge: average}
+    B: {range: [40, 76], merge: average}
+
+  use:
+    wavecal: [A, B]      # Separate calibration for each group
+    # OR
+    wavecal: [cal]       # Use only calibration fiber
+    # OR
+    wavecal: per_fiber   # Separate calibration per fiber_idx
+    # OR
+    wavecal: all         # All traces together (default)
+```
+
+- **`[A, B]`** - Calibrate each named group separately. Useful when groups have
+  different optical paths (e.g., science fibers A and B).
+
+- **`per_fiber`** - Calibrate each fiber index separately. Each unique
+  `fiber_idx` value gets its own wavelength polynomial. Use this when individual
+  fibers within a group have slightly different wavelength solutions and you
+  want maximum precision.
+
+- **`all`** - Combine all traces into a single calibration (default for
+  single-fiber instruments).
+
+The wavelength polynomial is stored in each `Trace.wave` attribute and saved to
+`traces.fits`. Subsequent steps (science extraction, continuum normalization)
+read wavelengths directly from the traces.
+
+See [Fiber Bundle Configuration](fiber_bundle_tracing.md) for full details on
+multi-fiber setup.
 
 ### Continuum Normalization
 

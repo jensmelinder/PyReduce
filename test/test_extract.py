@@ -3,6 +3,7 @@ import pytest
 from scipy.signal.windows import gaussian
 
 from pyreduce import extract
+from pyreduce.trace_model import Trace
 
 # All tests in this file are unit tests using synthetic data
 pytestmark = pytest.mark.unit
@@ -66,6 +67,15 @@ def orders(width, ycen):
 
 
 @pytest.fixture
+def trace_objects(orders, width):
+    """Create Trace objects from polynomial orders."""
+    return [
+        Trace(m=i, group=0, pos=orders[i], column_range=(0, width))
+        for i in range(len(orders))
+    ]
+
+
+@pytest.fixture
 def sample_data(width, height, spec, slitf, oversample, ycen, p1=0):
     img = spec[None, :] * slitf[:, None]
     # TODO more sophisticated sample data creation
@@ -124,7 +134,7 @@ def test_fix_column_range():
     # Some orders will be shortened
     nrow, ncol = 50, 1000
     orders = np.array([[0.2, 3], [0.2, 5], [0.2, 7], [0.2, 9]])
-    ew = np.array([[10, 10], [10, 10], [10, 10], [10, 10]])
+    ew = np.array([20, 20, 20, 20])  # full height = 20 (10 each side)
     cr = np.array([[0, 1000], [0, 1000], [0, 1000], [0, 1000]])
 
     fixed_cr, fixed_orders = extract.fix_column_range(cr, orders, ew, nrow, ncol)
@@ -137,7 +147,7 @@ def test_fix_column_range():
 
     # Nothing should change here
     orders = np.array([[20], [20], [20]])
-    ew = np.array([[10, 10], [10, 10], [10, 10]])
+    ew = np.array([20, 20, 20])  # full height = 20
     cr = np.array([[0, 1000], [0, 1000], [0, 1000]])
 
     fixed_cr, fixed_orders = extract.fix_column_range(
@@ -183,7 +193,7 @@ def test_fix_parameters():
     ncol, nrow, nord = 100, 100, 1
 
     # Everything None, i.e. most default settings
-    # extraction_height is now full height (split evenly above/below trace)
+    # extraction_height is now full height, stored internally as half-height
     for xwd in [None, 0.4, 8, 20]:
         for cr in [None, (1, 90), [[4, 100]]]:
             xwd, cr, orders = extract.fix_parameters(xwd, cr, orders, ncol, nrow, nord)
@@ -191,9 +201,8 @@ def test_fix_parameters():
             assert isinstance(cr, np.ndarray)
             assert isinstance(orders, np.ndarray)
 
-            assert xwd.ndim == 2
+            assert xwd.ndim == 1
             assert xwd.shape[0] == nord
-            assert xwd.shape[1] == 2
             assert cr.ndim == 2
             assert cr.shape[0] == nord
             assert cr.shape[1] == 2
@@ -211,15 +220,14 @@ def test_fix_parameters():
 def test_simple_extraction(sample_data, orders, width, oversample):
     img, spec, slitf = sample_data
 
-    extraction_height = np.array([[10, 10]])
+    extraction_height = np.array([20])  # full height = 20 pixels (10 each side)
     column_range = np.array([[0, width]])
 
     nord = len(orders)
-    p1 = np.zeros((nord, width))
-    p2 = np.zeros((nord, width))
+    curvature = np.zeros((nord, width, 3))
 
     spec_out, unc_out = extract.simple_extraction(
-        img, orders, extraction_height, column_range, p1=p1, p2=p2
+        img, orders, extraction_height, column_range, curvature=curvature
     )
 
     assert isinstance(spec_out, np.ndarray)
@@ -236,56 +244,68 @@ def test_simple_extraction(sample_data, orders, width, oversample):
     assert np.abs(np.diff(unc_out / spec_out)).max() < oversample / 5 + 1e-1
 
 
-def test_vertical_extraction(sample_data, orders, width, height, oversample):
+def test_vertical_extraction(sample_data, trace_objects, width, height, oversample):
     img, spec, slitf = sample_data
 
-    spec_vert, sunc_vert, slitf_vert, _ = extract.extract(img, orders)
+    spectra = extract.extract(img, trace_objects)
 
-    assert isinstance(spec_vert, np.ma.masked_array)
-    assert spec_vert.ndim == 2
-    assert spec_vert.shape[0] == orders.shape[0]
-    assert spec_vert.shape[1] == width
+    assert isinstance(spectra, list)
+    assert len(spectra) == len(trace_objects)
 
-    assert isinstance(sunc_vert, np.ma.masked_array)
-    assert sunc_vert.ndim == 2
-    assert sunc_vert.shape[0] == orders.shape[0]
-    assert sunc_vert.shape[1] == width
+    for s in spectra:
+        assert hasattr(s, "spec")
+        assert hasattr(s, "sig")
+        assert s.spec.shape == (width,)
+        assert s.sig.shape == (width,)
 
-    assert isinstance(slitf_vert, list)
-    assert len(slitf_vert) == orders.shape[0]
-    assert len(slitf_vert[0]) <= height * oversample
-
-    assert not np.any(spec_vert == 0)
-    assert np.abs(np.diff(spec / spec_vert[0])).max() <= 1e-1
-
-    assert not np.any(sunc_vert == 0)
-    # assert np.abs(sunc_vert / spec_vert).max() <= 1e-2
+    spec_vert = spectra[0].spec
+    assert not np.all(np.isnan(spec_vert))
+    valid = ~np.isnan(spec_vert)
+    assert np.abs(np.diff(spec[valid] / spec_vert[valid])).max() <= 1e-1
 
 
-def test_curved_equal_vertical_extraction(sample_data, orders):
-    # Currently extract always uses the vertical extraction, making this kind of useless
+def test_curved_equal_vertical_extraction(sample_data, orders, width):
+    # Curved extraction with zero curvature should match vertical extraction
     img, spec, slitf = sample_data
-    p1 = 0
-    p2 = 0
 
-    spec_curved, sunc_curved, slitf_curved, _ = extract.extract(
-        img, orders, p1=p1, p2=p2
-    )
-    spec_vert, sunc_vert, slitf_vert, _ = extract.extract(img, orders)
+    # Create traces with zero curvature
+    traces_curved = [
+        Trace(
+            m=i,
+            group=0,
+            pos=orders[i],
+            column_range=(0, width),
+            slit=np.zeros((3, 6)),  # degree 2, 6 x-coeffs
+        )
+        for i in range(len(orders))
+    ]
+    traces_vert = [
+        Trace(m=i, group=0, pos=orders[i], column_range=(0, width))
+        for i in range(len(orders))
+    ]
 
-    assert np.allclose(spec_curved, spec_vert, rtol=1e-2)
-    # assert np.allclose(sunc_curved, sunc_vert, rtol=0.1)
+    spectra_curved = extract.extract(img, traces_curved)
+    spectra_vert = extract.extract(img, traces_vert)
+
+    spec_curved = spectra_curved[0].spec
+    spec_vert = spectra_vert[0].spec
+    slitf_curved = spectra_curved[0].slitfu
+    slitf_vert = spectra_vert[0].slitfu
+
+    valid = ~np.isnan(spec_curved) & ~np.isnan(spec_vert)
+    assert np.allclose(spec_curved[valid], spec_vert[valid], rtol=1e-2)
     assert np.allclose(slitf_curved, slitf_vert, rtol=1e-1)
 
 
 def test_optimal_extraction(sample_data, orders, height, width):
     img, spec, slitf = sample_data
-    xwd = np.array([[height // 2, height // 2]])
+    xwd = np.array([height])  # full height
     cr = np.array([[0, width]])
-    p1 = p2 = np.zeros((1, width))
+    # curvature shape: (ntrace, ncol, n_coeffs), all zeros for vertical extraction
+    curvature = np.zeros((1, width, 3))
 
     res_spec, res_slitf, res_unc = extract.optimal_extraction(
-        img, orders, xwd, cr, p1, p2
+        img, orders, xwd, cr, curvature=curvature
     )
 
     assert isinstance(res_spec, np.ndarray)
@@ -309,14 +329,15 @@ def test_extract_spectrum(sample_data, orders, ycen, width, height):
     img, spec, slitf = sample_data
 
     column_range = np.array([[20, width]])
-    extraction_height = np.array([[10, 10]])
+    extraction_height = np.array([20])  # full height
 
     yrange = extract.get_y_scale(ycen, column_range[0], extraction_height[0], height)
     xrange = column_range[0]
 
     out_spec = np.zeros(width)
     out_sunc = np.zeros(width)
-    out_slitf = np.zeros(10 + 10 + 2 + 1)
+    nslitf = sum(yrange) + 2 + 1  # osample=1
+    out_slitf = np.zeros(nslitf)
     out_mask = np.zeros(width)
 
     extract.extract_spectrum(
@@ -347,7 +368,7 @@ def test_extract_spectrum(sample_data, orders, ycen, width, height):
 
 def test_get_y_scale(ycen, height, width):
     xrange = (0, width)
-    xwd = (10, 10)
+    xwd = 20  # full height
     y_lower_lim, y_upper_lim = extract.get_y_scale(ycen, xrange, xwd, height)
 
     assert isinstance(y_lower_lim, int)
@@ -355,7 +376,7 @@ def test_get_y_scale(ycen, height, width):
     assert y_lower_lim >= 0
     assert y_upper_lim < height
 
-    xwd = (2 * height, 2 * height)
+    xwd = 4 * height  # full height = 4 * height
     y_lower_lim, y_upper_lim = extract.get_y_scale(ycen, xrange, xwd, height)
     assert isinstance(y_lower_lim, int)
     assert isinstance(y_upper_lim, int)
@@ -363,7 +384,7 @@ def test_get_y_scale(ycen, height, width):
     assert y_upper_lim < height
 
     ycen_tmp = ycen + height
-    xwd = (10, 10)
+    xwd = 20  # full height
     y_lower_lim, y_upper_lim = extract.get_y_scale(ycen_tmp, xrange, xwd, height)
     assert isinstance(y_lower_lim, int)
     assert isinstance(y_upper_lim, int)
@@ -371,11 +392,79 @@ def test_get_y_scale(ycen, height, width):
     assert y_upper_lim < height
 
 
-def test_extract(sample_data, orders):
+class TestGetYScale:
+    """Tests capturing get_y_scale outputs for standard and edge cases."""
+
+    def test_centered_odd_height(self):
+        ycen = np.full(100, 24.5)
+        assert extract.get_y_scale(ycen, (0, 100), 21, 50) == (10, 10)
+
+    def test_centered_even_height(self):
+        ycen = np.full(100, 24.5)
+        assert extract.get_y_scale(ycen, (0, 100), 20, 50) == (10, 9)
+
+    def test_integer_ycen(self):
+        ycen = np.full(100, 25.0)
+        assert extract.get_y_scale(ycen, (0, 100), 21, 50) == (10, 10)
+        ycen = np.full(100, 25.0)
+        assert extract.get_y_scale(ycen, (0, 100), 20, 50) == (10, 9)
+
+    def test_sloped_trace(self):
+        ycen = np.linspace(23.0, 27.0, 100)
+        assert extract.get_y_scale(ycen, (0, 100), 21, 50) == (10, 10)
+        ycen = np.linspace(23.0, 27.0, 100)
+        assert extract.get_y_scale(ycen, (0, 100), 20, 50) == (10, 9)
+
+    def test_partial_column_range(self):
+        ycen = np.full(100, 24.5)
+        assert extract.get_y_scale(ycen, (20, 80), 21, 50) == (10, 10)
+
+    def test_near_bottom(self):
+        ycen = np.full(100, 3.7)
+        assert extract.get_y_scale(ycen, (0, 100), 21, 50) == (4, 16)
+        ycen = np.full(100, 3.7)
+        assert extract.get_y_scale(ycen, (0, 100), 20, 50) == (4, 15)
+
+    def test_near_top(self):
+        ycen = np.full(100, 46.3)
+        assert extract.get_y_scale(ycen, (0, 100), 21, 50) == (17, 3)
+        ycen = np.full(100, 46.3)
+        assert extract.get_y_scale(ycen, (0, 100), 20, 50) == (17, 2)
+
+    def test_height_1(self):
+        ycen = np.full(100, 24.5)
+        assert extract.get_y_scale(ycen, (0, 100), 1, 50) == (0, 0)
+
+    def test_sloped_near_edge(self):
+        ycen = np.linspace(2.0, 8.0, 100)
+        assert extract.get_y_scale(ycen, (0, 100), 15, 50) == (2, 12)
+
+    def test_oversize_extraction(self):
+        ycen = np.full(100, 24.5)
+        ylow, yhigh = extract.get_y_scale(ycen, (0, 100), 200, 50)
+        assert ylow + yhigh + 1 <= 200
+        assert ylow >= 0
+
+    def test_no_mutation(self):
+        """get_y_scale must not modify the input ycen array."""
+        ycen = np.full(100, 24.5)
+        original = ycen.copy()
+        extract.get_y_scale(ycen, (0, 100), 21, 50)
+        np.testing.assert_array_equal(ycen, original)
+
+    def test_total_height_invariant(self):
+        """ylow + yhigh + 1 must equal extraction_height when it fits."""
+        for eh in [1, 5, 10, 15, 20, 21]:
+            ycen = np.full(100, 24.5)
+            ylow, yhigh = extract.get_y_scale(ycen, (0, 100), eh, 50)
+            assert ylow + yhigh + 1 == eh, f"height={eh}: {ylow}+{yhigh}+1 != {eh}"
+
+
+def test_extract(sample_data, trace_objects):
     img, spec, slitf = sample_data
 
     with pytest.raises(ValueError):
-        extract.extract(img, orders, extraction_type="foobar")
+        extract.extract(img, trace_objects, extraction_type="foobar")
 
 
 class TestPresetSlitfunc:
@@ -408,6 +497,16 @@ class TestPresetSlitfunc:
         width = len(simple_ycen)
         fit = np.polyfit(np.arange(width), simple_ycen, deg=2)
         return np.atleast_2d(fit)
+
+    @pytest.fixture
+    def simple_traces(self, simple_orders, simple_img):
+        """Trace objects for the simple test case."""
+        _, _, _ = simple_img
+        width = 100
+        return [
+            Trace(m=i, group=0, pos=simple_orders[i], column_range=(0, width))
+            for i in range(len(simple_orders))
+        ]
 
     def test_preset_slitfunc_correct_size(self, simple_img, simple_ycen):
         """Test extraction with correctly sized preset slitfunc."""
@@ -458,7 +557,7 @@ class TestPresetSlitfunc:
                 preset_slitfunc=preset,
             )
 
-    def test_preset_slitfunc_through_extract(self, simple_img, simple_orders):
+    def test_preset_slitfunc_through_extract(self, simple_img, simple_traces):
         """Test preset_slitfunc passed through extract() function."""
         img, _, _ = simple_img
         height, width = img.shape
@@ -466,18 +565,21 @@ class TestPresetSlitfunc:
         extraction_height = 5  # fixed integer
 
         # First extract normally to get a slitfunc
-        spec1, unc1, slitfunc_list, _ = extract.extract(
+        spectra1 = extract.extract(
             img.copy(),
-            simple_orders,
+            simple_traces,
             extraction_type="optimal",
             extraction_height=extraction_height,
             osample=osample,
         )
 
+        # Get slitfunc list from Spectrum objects
+        slitfunc_list = [s.slitfu for s in spectra1]
+
         # Now extract with preset slitfunc
-        spec2, unc2, slitfunc_out, _ = extract.extract(
+        spectra2 = extract.extract(
             img.copy(),
-            simple_orders,
+            simple_traces,
             extraction_type="optimal",
             extraction_height=extraction_height,
             osample=osample,
@@ -486,8 +588,9 @@ class TestPresetSlitfunc:
         )
 
         # Results should be similar
-        assert spec2 is not None
-        assert spec2.shape == spec1.shape
+        assert spectra2 is not None
+        assert len(spectra2) == len(spectra1)
+        assert spectra2[0].spec.shape == spectra1[0].spec.shape
 
 
 class TestAdaptSlitfunc:
@@ -550,3 +653,457 @@ class TestAdaptSlitfunc:
         assert len(result) == tgt_nslitf
         # Should be normalized to target osample
         assert abs(result.sum() - tgt_osample) < 0.1
+
+
+class TestSlitdeltasExtraction:
+    """Tests for slitdeltas handling in extraction."""
+
+    def test_extract_spectrum_with_slitdeltas(self):
+        """Test that slitdeltas parameter is accepted and used."""
+        nrow, ncol = 50, 100
+        img = np.random.normal(100, 10, (nrow, ncol)).astype(np.float64)
+        img[20:30, :] += 100
+
+        ycen = np.full(ncol, 25.0)
+        yrange = (5, 5)
+        xrange = np.array([10, 90])
+
+        slitdeltas = np.linspace(-0.1, 0.1, 11)
+
+        spec, slitf, mask, unc = extract.extract_spectrum(
+            img,
+            ycen,
+            yrange,
+            xrange,
+            slitdeltas=slitdeltas,
+            osample=1,
+        )
+
+        assert spec.shape == (ncol,)
+        assert not np.all(np.isnan(spec[xrange[0] : xrange[1]]))
+
+    def test_extract_spectrum_slitdeltas_interpolation(self):
+        """Test that slitdeltas are interpolated when length differs."""
+        nrow, ncol = 50, 100
+        img = np.random.normal(100, 10, (nrow, ncol)).astype(np.float64)
+        img[20:30, :] += 100
+
+        ycen = np.full(ncol, 25.0)
+        yrange = (5, 5)
+        xrange = np.array([10, 90])
+
+        # Provide different length slitdeltas
+        slitdeltas = np.linspace(-0.1, 0.1, 21)
+
+        spec, slitf, mask, unc = extract.extract_spectrum(
+            img,
+            ycen,
+            yrange,
+            xrange,
+            slitdeltas=slitdeltas,
+            osample=1,
+        )
+
+        assert spec.shape == (ncol,)
+
+    def test_extract_spectrum_no_slitdeltas(self):
+        """Test extraction works without slitdeltas (None)."""
+        nrow, ncol = 50, 100
+        img = np.random.normal(100, 10, (nrow, ncol)).astype(np.float64)
+        img[20:30, :] += 100
+
+        ycen = np.full(ncol, 25.0)
+        yrange = (5, 5)
+        xrange = np.array([10, 90])
+
+        spec, slitf, mask, unc = extract.extract_spectrum(
+            img,
+            ycen,
+            yrange,
+            xrange,
+            slitdeltas=None,
+            osample=1,
+        )
+
+        assert spec.shape == (ncol,)
+
+    def test_optimal_extraction_with_slitdeltas(self):
+        """Test optimal_extraction passes slitdeltas to extract_spectrum."""
+        nrow, ncol = 50, 100
+        img = np.random.normal(100, 10, (nrow, ncol)).astype(np.float64)
+        img[20:30, :] += 100  # Add signal at trace location
+
+        # Trace polynomial: y = 0*x + 25 (constant at row 25)
+        traces = np.array([[0.0, 25.0]])
+        extraction_height = np.array([10])
+        column_range = np.array([[0, ncol]])
+
+        # slitdeltas has shape (ntrace, nrows)
+        slitdeltas = np.zeros((1, 10))
+        slitdeltas[0, :] = np.linspace(-0.05, 0.05, 10)
+
+        spec, slitf, unc = extract.optimal_extraction(
+            img,
+            traces,
+            extraction_height,
+            column_range,
+            slitdeltas=slitdeltas,
+            osample=1,
+        )
+
+        assert spec.shape == (1, ncol)
+
+    def test_extract_with_slitdeltas(self):
+        """Test main extract() function passes slitdeltas through."""
+        nrow, ncol = 50, 100
+        img = np.random.normal(100, 10, (nrow, ncol)).astype(np.float64)
+        img[20:30, :] += 100
+
+        # Create Trace with slitdelta
+        slitdelta = np.linspace(-0.02, 0.02, 10)
+        traces = [
+            Trace(
+                m=0,
+                group=0,
+                pos=np.array([0.0, 25.0]),
+                column_range=(0, ncol),
+                slitdelta=slitdelta,
+            )
+        ]
+
+        spectra = extract.extract(
+            img,
+            traces,
+            extraction_height=10,
+            osample=1,
+        )
+
+        assert len(spectra) == 1
+        assert spectra[0].spec.shape == (ncol,)
+
+    def test_extract_multiple_traces(self):
+        """Test extraction of multiple traces."""
+        nrow, ncol = 80, 100
+        img = np.random.normal(100, 10, (nrow, ncol)).astype(np.float64)
+        img[20:30, :] += 100  # First trace
+        img[50:60, :] += 100  # Second trace
+
+        # Two traces: y = 25 and y = 55
+        traces = [
+            Trace(m=0, group=0, pos=np.array([0.0, 25.0]), column_range=(0, ncol)),
+            Trace(m=1, group=0, pos=np.array([0.0, 55.0]), column_range=(0, ncol)),
+        ]
+
+        spectra = extract.extract(
+            img,
+            traces,
+            extraction_height=10,
+            osample=1,
+        )
+
+        assert len(spectra) == 2
+        assert spectra[0].spec.shape == (ncol,)
+        assert spectra[1].spec.shape == (ncol,)
+
+
+class TestTraceCurvatureExtraction:
+    """Tests for Trace.slit curvature being used in extraction."""
+
+    def test_extract_with_trace_slit(self):
+        """Test extraction accepts and uses Trace.slit curvature."""
+        nrow, ncol = 50, 100
+        img = np.random.normal(100, 10, (nrow, ncol)).astype(np.float64)
+        img[20:30, :] += 100
+
+        # Create trace with slit curvature polynomial
+        # slit[i, :] = coefficients for y^i term as function of x
+        # Linear tilt: offset = 0.01 * y (slight tilt)
+        slit = np.array([[0.0, 0.0], [0.0, 0.01]])  # (deg_y+1, deg_x+1)
+
+        traces = [
+            Trace(
+                m=5,
+                group="A",
+                pos=np.array([0.0, 25.0]),
+                column_range=(0, ncol),
+                slit=slit,
+            )
+        ]
+
+        spectra = extract.extract(
+            img,
+            traces,
+            extraction_height=10,
+            osample=1,
+        )
+
+        assert len(spectra) == 1
+        assert spectra[0].spec.shape == (ncol,)
+        # Verify identity preserved
+        assert spectra[0].m == 5
+        assert spectra[0].group == "A"
+
+    def test_extract_with_both_slit_and_slitdelta(self):
+        """Test extraction with both Trace.slit and Trace.slitdelta."""
+        nrow, ncol = 50, 100
+        img = np.random.normal(100, 10, (nrow, ncol)).astype(np.float64)
+        img[20:30, :] += 100
+
+        # Curvature polynomial
+        slit = np.array([[0.0, 0.0], [0.0, 0.005]])
+        # Per-row corrections
+        slitdelta = np.linspace(-0.02, 0.02, 10)
+
+        traces = [
+            Trace(
+                m=10,
+                group="cal",
+                pos=np.array([0.0, 25.0]),
+                column_range=(0, ncol),
+                slit=slit,
+                slitdelta=slitdelta,
+            )
+        ]
+
+        spectra = extract.extract(
+            img,
+            traces,
+            extraction_height=10,
+            osample=1,
+        )
+
+        assert len(spectra) == 1
+        assert spectra[0].m == 10
+        assert spectra[0].group == "cal"
+
+    def test_extract_mixed_traces_some_with_curvature(self):
+        """Test extraction when some traces have curvature and others don't."""
+        nrow, ncol = 80, 100
+        img = np.random.normal(100, 10, (nrow, ncol)).astype(np.float64)
+        img[20:30, :] += 100
+        img[50:60, :] += 100
+
+        slit = np.array([[0.0, 0.0], [0.0, 0.01]])
+
+        traces = [
+            Trace(
+                m=1,
+                group="A",
+                pos=np.array([0.0, 25.0]),
+                column_range=(0, ncol),
+                slit=slit,  # Has curvature
+            ),
+            Trace(
+                m=2,
+                group="B",
+                pos=np.array([0.0, 55.0]),
+                column_range=(0, ncol),
+                # No curvature
+            ),
+        ]
+
+        spectra = extract.extract(
+            img,
+            traces,
+            extraction_height=10,
+            osample=1,
+        )
+
+        assert len(spectra) == 2
+        assert spectra[0].m == 1
+        assert spectra[1].m == 2
+
+    def test_extract_higher_degree_curvature(self):
+        """Test extraction with higher-degree curvature polynomial."""
+        nrow, ncol = 50, 100
+        img = np.random.normal(100, 10, (nrow, ncol)).astype(np.float64)
+        img[20:30, :] += 100
+
+        # Quadratic curvature: offset = c0 + c1*y + c2*y^2
+        # Each row is coefficients for y^i term as polynomial in x
+        slit = np.array(
+            [
+                [0.0, 0.0, 0.0],  # y^0 term
+                [0.0, 0.0, 0.01],  # y^1 term (linear tilt)
+                [0.0, 0.0, 0.001],  # y^2 term (curvature)
+            ]
+        )
+
+        traces = [
+            Trace(
+                m=1,
+                group=0,
+                pos=np.array([0.0, 25.0]),
+                column_range=(0, ncol),
+                slit=slit,
+            )
+        ]
+
+        spectra = extract.extract(
+            img,
+            traces,
+            extraction_height=10,
+            osample=1,
+        )
+
+        assert len(spectra) == 1
+
+    def test_trace_slit_at_x_used_correctly(self):
+        """Verify slit_at_x evaluates curvature polynomial correctly."""
+        # This tests the Trace method that extract() uses internally
+        # slit[i, :] = polyval coefficients for y^i term as function of x
+        # np.polyval([a, b], x) = a*x + b (highest power first)
+        # So [0.0, 0.1] means 0*x + 0.1 = 0.1 (constant)
+        slit = np.array(
+            [
+                [0.0, 0.1],  # y^0 term: constant 0.1
+                [0.0, 0.02],  # y^1 term: constant 0.02
+            ]
+        )
+
+        trace = Trace(
+            m=1, group=0, pos=np.array([0.0, 100.0]), column_range=(0, 1000), slit=slit
+        )
+
+        # At x=0: coeffs should be [0.1, 0.02]
+        coeffs = trace.slit_at_x(0)
+        np.testing.assert_array_almost_equal(coeffs, [0.1, 0.02])
+
+        # At x=500: same since polynomials are constant
+        coeffs = trace.slit_at_x(500)
+        np.testing.assert_array_almost_equal(coeffs, [0.1, 0.02])
+
+        # Test with x-varying polynomial: [0.001, 0.1] means 0.001*x + 0.1
+        slit_varying = np.array(
+            [
+                [0.001, 0.0],  # y^0 term: 0.001*x
+                [0.0, 0.02],  # y^1 term: constant 0.02
+            ]
+        )
+        trace2 = Trace(
+            m=1,
+            group=0,
+            pos=np.array([0.0, 100.0]),
+            column_range=(0, 1000),
+            slit=slit_varying,
+        )
+        coeffs = trace2.slit_at_x(1000)
+        np.testing.assert_array_almost_equal(coeffs, [1.0, 0.02])
+
+    def test_trace_identity_preserved_through_extraction(self):
+        """Verify m, fiber are copied from Trace to Spectrum."""
+        nrow, ncol = 50, 100
+        img = np.random.normal(100, 10, (nrow, ncol)).astype(np.float64)
+        img[20:30, :] += 100
+
+        traces = [
+            Trace(
+                m=42,
+                group="science_A",
+                pos=np.array([0.0, 25.0]),
+                column_range=(0, ncol),
+                height=12.0,
+            )
+        ]
+
+        spectra = extract.extract(
+            img,
+            traces,
+            extraction_height=10,  # Should be overridden by trace.height
+            osample=1,
+        )
+
+        assert spectra[0].m == 42
+        assert spectra[0].group == "science_A"
+
+    def test_settings_height_overrides_trace(self):
+        """Settings extraction_height takes precedence over trace.height."""
+        nrow, ncol = 50, 100
+        img = np.random.normal(100, 10, (nrow, ncol)).astype(np.float64)
+        img[15:35, :] += 100
+
+        traces = [
+            Trace(
+                m=1,
+                group=0,
+                pos=np.array([0.0, 25.0]),
+                column_range=(0, ncol),
+                height=20.0,
+            )
+        ]
+
+        # Explicit setting (10) wins over trace.height (20)
+        spectra = extract.extract(
+            img,
+            traces,
+            extraction_height=10,
+            osample=1,
+        )
+        assert spectra[0].extraction_height == pytest.approx(10.0)
+
+    def test_trace_height_used_when_settings_none(self):
+        """trace.height is used as fallback when extraction_height is None."""
+        nrow, ncol = 50, 100
+        img = np.random.normal(100, 10, (nrow, ncol)).astype(np.float64)
+        img[15:35, :] += 100
+
+        traces = [
+            Trace(
+                m=1,
+                group=0,
+                pos=np.array([0.0, 25.0]),
+                column_range=(0, ncol),
+                height=20.0,
+            )
+        ]
+
+        spectra = extract.extract(
+            img,
+            traces,
+            extraction_height=None,
+            osample=1,
+        )
+        assert spectra[0].extraction_height == pytest.approx(20.0)
+
+    def test_trace_wave_available_for_evaluation(self):
+        """Verify Trace.wave can be evaluated after extraction.
+
+        Note: extract() does not copy wave to Spectrum - that's done by
+        pipeline steps. But the trace.wave should remain accessible for
+        later evaluation.
+        """
+        nrow, ncol = 50, 100
+        img = np.random.normal(100, 10, (nrow, ncol)).astype(np.float64)
+        img[20:30, :] += 100
+
+        # Wavelength polynomial: wave = 0.5*x + 5000
+        wave_coef = np.array([0.5, 5000.0])
+
+        traces = [
+            Trace(
+                m=1,
+                group=0,
+                pos=np.array([0.0, 25.0]),
+                column_range=(0, ncol),
+                wave=wave_coef,
+            )
+        ]
+
+        spectra = extract.extract(
+            img,
+            traces,
+            extraction_height=10,
+            osample=1,
+        )
+
+        # Extraction doesn't copy wave, but trace.wave should still work
+        x = np.arange(ncol)
+        wave = traces[0].wlen(x)
+        assert wave is not None
+        assert wave[0] == pytest.approx(5000.0)
+        assert wave[99] == pytest.approx(5000.0 + 0.5 * 99)
+
+        # extract() now evaluates trace wavelength into the Spectrum
+        assert spectra[0].wave is not None
+        assert spectra[0].wave[0] == pytest.approx(5000.0)
+        assert spectra[0].wave[99] == pytest.approx(5000.0 + 0.5 * 99)

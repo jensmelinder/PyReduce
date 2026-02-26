@@ -26,7 +26,6 @@ from scipy.optimize import least_squares
 from tqdm import tqdm
 
 from . import util
-from .extract import fix_parameters
 from .util import make_index
 from .util import polyfit2d_2 as polyfit2d
 
@@ -39,7 +38,6 @@ class Curvature:
         traces,
         curve_height=0.5,
         extraction_height=0.2,
-        column_range=None,
         trace_range=None,
         window_width=9,
         peak_threshold=10,
@@ -52,10 +50,9 @@ class Curvature:
         peak_function="gaussian",
         curve_degree=2,
     ):
-        self.traces = traces
+        self.traces = traces  # list[Trace]
         self.curve_height = curve_height
         self.extraction_height = extraction_height
-        self.column_range = column_range
         if trace_range is None:
             trace_range = (0, self.ntrace)
         self.trace_range = trace_range
@@ -70,8 +67,8 @@ class Curvature:
         self.curve_degree = curve_degree
         self.peak_function = peak_function
 
-        if self.curve_degree not in (1, 2):
-            raise ValueError("Only curvature degrees 1 and 2 are supported")
+        if self.curve_degree < 1 or self.curve_degree > 5:
+            raise ValueError(f"Curvature degree must be 1-5, got {self.curve_degree}")
 
         if self.mode == "1D":
             # fit degree is an integer
@@ -84,7 +81,7 @@ class Curvature:
 
     @property
     def ntrace(self):
-        return self.traces.shape[0]
+        return len(self.traces)
 
     @property
     def n(self):
@@ -103,28 +100,55 @@ class Curvature:
         self._mode = value
 
     def _fix_inputs(self, original):
-        traces = self.traces
-        curve_height = self.curve_height
-        extraction_height = self.extraction_height
-        column_range = self.column_range
-
         nrow, ncol = original.shape
+
+        # Apply trace_range slicing
+        traces = self.traces[self.trace_range[0] : self.trace_range[1]]
         ntrace = len(traces)
 
-        curve_height, column_range, traces = fix_parameters(
-            curve_height, column_range, traces, nrow, ncol, ntrace
-        )
-        extraction_height, _, _ = fix_parameters(
-            extraction_height, column_range, traces, nrow, ncol, ntrace
-        )
+        # Build column_range array from trace objects
+        column_range = np.array([t.column_range for t in traces])
 
-        self.column_range = column_range[self.trace_range[0] : self.trace_range[1]]
-        self.curve_height = curve_height[self.trace_range[0] : self.trace_range[1]]
-        self.extraction_height = extraction_height[
-            self.trace_range[0] : self.trace_range[1]
-        ]
-        self.traces = traces[self.trace_range[0] : self.trace_range[1]]
-        self.trace_range = (0, self.ntrace)
+        # Compute curve_height in pixels if fractional
+        curve_height = self.curve_height
+        if np.isscalar(curve_height) and curve_height < 3:
+            # Fraction of order spacing
+            x_mid = ncol // 2
+            y_mids = np.array([np.polyval(t.pos, x_mid) for t in traces])
+            if len(y_mids) > 1:
+                spacing = np.median(np.abs(np.diff(np.sort(y_mids))))
+                curve_height = int(curve_height * spacing)
+            else:
+                curve_height = 10
+        if np.isscalar(curve_height):
+            curve_height = np.full(ntrace, int(curve_height))
+        else:
+            curve_height = np.asarray(curve_height, dtype=int)
+
+        # For curvature, extraction_height is always literal pixels
+        extraction_height = self.extraction_height
+        if np.isscalar(extraction_height):
+            extraction_height = np.full(ntrace, int(extraction_height))
+        else:
+            extraction_height = np.asarray(extraction_height, dtype=int)
+
+        # Clip column_range to image bounds considering curve_height
+        for i in range(ntrace):
+            x = np.arange(ncol)
+            ycen = np.polyval(traces[i].pos, x)
+            half = curve_height[i] // 2
+            # Find valid column range where trace fits in image
+            valid = (ycen - half >= 0) & (ycen + half < nrow)
+            if np.any(valid):
+                valid_cols = np.where(valid)[0]
+                column_range[i, 0] = max(column_range[i, 0], valid_cols[0])
+                column_range[i, 1] = min(column_range[i, 1], valid_cols[-1] + 1)
+
+        self.column_range = column_range
+        self.curve_height = curve_height
+        self.extraction_height = extraction_height
+        self.traces = traces
+        self.trace_range = (0, ntrace)
 
     def _find_peaks(self, vec, cr):
         # This should probably be the same as in the wavelength calibration
@@ -166,26 +190,45 @@ class Curvature:
         xwd = self.extraction_height[order_idx]
         curve_xwd = self.curve_height[order_idx]
 
-        # Number of spectra to extract
-        total_extraction = xwd[0] + xwd[1]
-        total_curve = curve_xwd[0] + curve_xwd[1]
-        n_offsets = max(1, int(total_curve // total_extraction))
-
-        # Compute offset centers, symmetric around trace
-        offsets = (np.arange(n_offsets) - (n_offsets - 1) / 2) * total_extraction
-
         # Get trace position
         x = np.arange(ncol)
-        ycen = np.polyval(self.traces[order_idx], x)
+        ycen = np.polyval(self.traces[order_idx].pos, x)
         ycen_int = ycen.astype(int)
+
+        # Special case: extraction_height=1 means row-by-row without extraction
+        if xwd == 1:
+            half = curve_xwd // 2
+            offsets = np.arange(-half, curve_xwd - half)
+            n_offsets = len(offsets)
+
+            spectra = np.ma.zeros((n_offsets, ncol))
+            spectra[:, :] = np.ma.masked
+
+            for i, offset in enumerate(offsets):
+                # Row position follows trace + offset
+                row = ycen_int + offset
+                # Check bounds
+                if np.any(row < 0) or np.any(row >= nrow):
+                    continue
+                # Direct indexing along the curved trace
+                spectra[i, cr[0] : cr[1]] = original[
+                    row[cr[0] : cr[1]], x[cr[0] : cr[1]]
+                ]
+
+            return spectra, offsets.astype(float)
+
+        # General case: extract and collapse multiple rows per offset
+        n_offsets = max(1, int(curve_xwd // xwd))
+        offsets = (np.arange(n_offsets) - (n_offsets - 1) / 2) * xwd
 
         spectra = np.ma.zeros((n_offsets, ncol))
         spectra[:, :] = np.ma.masked
 
+        half = xwd // 2
         for i, offset in enumerate(offsets):
             # Y bounds for this offset spectrum
-            yb = ycen_int + int(offset) - xwd[0]
-            yt = ycen_int + int(offset) + xwd[1]
+            yb = ycen_int + int(offset) - half
+            yt = yb + xwd - 1
 
             # Check bounds
             if np.any(yb < 0) or np.any(yt >= nrow):
@@ -294,9 +337,9 @@ class Curvature:
         return peaks, positions
 
     def _fit_curvature_from_positions(self, peaks, positions, offsets):
-        """Fit p1 and p2 from peak position vs y-offset.
+        """Fit polynomial curvature from peak position vs y-offset.
 
-        For each peak: x(y) = x0 + p1*y + p2*y^2
+        For each peak: x(y) = x0 + c1*y + c2*y^2 + ... + cn*y^n
 
         Parameters
         ----------
@@ -309,20 +352,24 @@ class Curvature:
 
         Returns
         -------
-        p1 : array of shape (n_peaks,)
-            Linear curvature coefficient for each peak
-        p2 : array of shape (n_peaks,)
-            Quadratic curvature coefficient for each peak
+        coeffs : array of shape (n_peaks, curve_degree)
+            Polynomial coefficients (excluding c0) for each peak.
+            coeffs[i, 0] is c1 (linear), coeffs[i, 1] is c2 (quadratic), etc.
+        residuals : array of shape (n_peaks, n_offsets)
+            Residuals (measured - fitted) at each offset for each peak.
+            NaN where no valid measurement.
         """
         n_peaks = len(peaks)
-        p1 = np.zeros(n_peaks)
-        p2 = np.zeros(n_peaks)
+        n_offsets = len(offsets)
+        coeffs = np.zeros((n_peaks, self.curve_degree))
+        residuals = np.full((n_peaks, n_offsets), np.nan)
+        min_points = self.curve_degree + 1
 
         for i in range(n_peaks):
             pos = positions[i]
             valid = ~np.isnan(pos)
 
-            if np.sum(valid) < 2:
+            if np.sum(valid) < min_points:
                 continue
 
             y = offsets[valid]
@@ -332,58 +379,69 @@ class Curvature:
             x0 = np.mean(x)
             dx = x - x0
 
-            if self.curve_degree == 1:
-                # Linear fit: dx = p1 * y
-                if np.sum(valid) >= 2:
-                    try:
-                        coef = np.polyfit(y, dx, 1)
-                        p1[i] = coef[0]
-                    except Exception:
-                        pass
-            elif self.curve_degree == 2:
-                # Quadratic fit: dx = p2 * y^2 + p1 * y
-                if np.sum(valid) >= 3:
-                    try:
-                        coef = np.polyfit(y, dx, 2)
-                        p2[i] = coef[0]
-                        p1[i] = coef[1]
-                    except Exception:
-                        pass
+            try:
+                # Fit polynomial of degree curve_degree
+                # polyfit returns coefficients in descending order: [c_n, ..., c_1, c_0]
+                poly_coef = np.polyfit(y, dx, self.curve_degree)
+                # We want ascending order without c0: [c_1, c_2, ..., c_n]
+                # poly_coef has length curve_degree+1
+                # poly_coef[-2] is c_1, poly_coef[-3] is c_2, etc.
+                for j in range(self.curve_degree):
+                    coeffs[i, j] = poly_coef[-(j + 2)]
 
-        return p1, p2
+                # Compute residuals: measured - fitted
+                dx_fitted = np.polyval(poly_coef, offsets)
+                residuals[i, :] = positions[i] - x0 - dx_fitted
+            except Exception:
+                pass
 
-    def _fit_curvature_single_order(self, peaks, p1, p2):
+        return coeffs, residuals
+
+    def _fit_curvature_single_order(self, peaks, coeffs):
+        """Fit smooth polynomial to curvature coefficients across an order.
+
+        Parameters
+        ----------
+        peaks : array
+            Peak columns
+        coeffs : array of shape (n_peaks, curve_degree)
+            Polynomial coefficients for each peak
+
+        Returns
+        -------
+        fitted_coeffs : array of shape (curve_degree, fit_degree + 1)
+            Fitted polynomial coefficients for each curvature term.
+            fitted_coeffs[i] gives polyval coefficients for the i-th curvature term.
+        peaks : array
+            Filtered peak columns
+        """
         try:
-            middle = np.median(p1)
-            sigma = np.percentile(p1, (32, 68))
+            # Use c1 (linear term) for outlier rejection
+            c1 = coeffs[:, 0] if coeffs.shape[1] > 0 else np.zeros(len(peaks))
+            middle = np.median(c1)
+            sigma = np.percentile(c1, (32, 68))
             sigma = middle - sigma[0], sigma[1] - middle
-            mask = (p1 >= middle - 5 * sigma[0]) & (p1 <= middle + 5 * sigma[1])
-            peaks, p1, p2 = peaks[mask], p1[mask], p2[mask]
+            mask = (c1 >= middle - 5 * sigma[0]) & (c1 <= middle + 5 * sigma[1])
+            peaks = peaks[mask]
+            coeffs = coeffs[mask]
 
-            coef_p1 = np.zeros(self.fit_degree + 1)
-            res = least_squares(
-                lambda coef: np.polyval(coef, peaks) - p1,
-                x0=coef_p1,
-                loss="arctan",
-            )
-            coef_p1 = res.x
+            fitted_coeffs = np.zeros((self.curve_degree, self.fit_degree + 1))
+            for i in range(self.curve_degree):
+                coef_init = np.zeros(self.fit_degree + 1)
+                res = least_squares(
+                    lambda coef, vals=coeffs[:, i]: np.polyval(coef, peaks) - vals,
+                    x0=coef_init,
+                    loss="arctan",
+                )
+                fitted_coeffs[i] = res.x
 
-            coef_p2 = np.zeros(self.fit_degree + 1)
-            res = least_squares(
-                lambda coef: np.polyval(coef, peaks) - p2,
-                x0=coef_p2,
-                loss="arctan",
-            )
-            coef_p2 = res.x
-
-        except:
+        except Exception:
             logger.error(
                 "Could not fit the curvature of this order. Using no curvature instead"
             )
-            coef_p1 = np.zeros(self.fit_degree + 1)
-            coef_p2 = np.zeros(self.fit_degree + 1)
+            fitted_coeffs = np.zeros((self.curve_degree, self.fit_degree + 1))
 
-        return coef_p1, coef_p2, peaks
+        return fitted_coeffs, peaks
 
     def _determine_curvature_all_lines(self, original):
         """Determine curvature for all lines using row-tracking method.
@@ -400,16 +458,21 @@ class Curvature:
         -------
         all_peaks : list of arrays
             Peak columns for each order
-        all_p1 : list of arrays
-            Tilt values for each peak in each order
-        all_p2 : list of arrays
-            Shear values for each peak in each order
+        all_coeffs : list of arrays
+            Curvature coefficients for each peak in each order.
+            Each entry has shape (n_peaks, curve_degree).
+        all_offsets : list of arrays
+            Y-offsets used for each order
+        all_residuals : list of arrays
+            Fit residuals for each peak at each offset.
+            Each entry has shape (n_peaks, n_offsets).
         plot_vec : list of arrays
             Middle spectrum for each order (for plotting)
         """
         all_peaks = []
-        all_p1 = []
-        all_p2 = []
+        all_coeffs = []
+        all_offsets = []
+        all_residuals = []
         plot_vec = []
 
         for j in tqdm(range(self.n), desc="Trace"):
@@ -431,57 +494,120 @@ class Curvature:
 
             if len(peaks) == 0:
                 all_peaks.append(np.array([]))
-                all_p1.append(np.array([]))
-                all_p2.append(np.array([]))
+                all_coeffs.append(np.zeros((0, self.curve_degree)))
+                all_offsets.append(offsets)
+                all_residuals.append(np.zeros((0, len(offsets))))
                 plot_vec.append(vec)
                 continue
 
             # Fit curvature from peak positions
-            p1, p2 = self._fit_curvature_from_positions(peaks, positions, offsets)
+            coeffs, residuals = self._fit_curvature_from_positions(
+                peaks, positions, offsets
+            )
 
             all_peaks.append(peaks)
-            all_p1.append(p1)
-            all_p2.append(p2)
+            all_coeffs.append(coeffs)
+            all_offsets.append(offsets)
+            all_residuals.append(residuals)
             plot_vec.append(vec)
 
-        return all_peaks, all_p1, all_p2, plot_vec
+        return all_peaks, all_coeffs, all_offsets, all_residuals, plot_vec
 
-    def fit(self, peaks, p1, p2):
+    def fit(self, peaks, all_coeffs):
+        """Fit smooth polynomial to curvature coefficients.
+
+        Parameters
+        ----------
+        peaks : list of arrays
+            Peak columns for each order
+        all_coeffs : list of arrays
+            Curvature coefficients for each order.
+            Each entry has shape (n_peaks, curve_degree).
+
+        Returns
+        -------
+        fitted_coeffs : array
+            For 1D mode: shape (n_orders, curve_degree, fit_degree + 1)
+            For 2D mode: shape (curve_degree, ...) with polyfit2d coefficients
+        """
         if self.mode == "1D":
-            coef_p1 = np.zeros((self.n, self.fit_degree + 1))
-            coef_p2 = np.zeros((self.n, self.fit_degree + 1))
+            fitted_coeffs = np.zeros((self.n, self.curve_degree, self.fit_degree + 1))
             for j in range(self.n):
-                coef_p1[j], coef_p2[j], _ = self._fit_curvature_single_order(
-                    peaks[j], p1[j], p2[j]
+                fitted_coeffs[j], _ = self._fit_curvature_single_order(
+                    peaks[j], all_coeffs[j]
                 )
         elif self.mode == "2D":
             x = np.concatenate(peaks)
             y = [np.full(len(p), i) for i, p in enumerate(peaks)]
             y = np.concatenate(y)
-            z = np.concatenate(p1)
-            coef_p1 = polyfit2d(x, y, z, degree=self.fit_degree, loss="arctan")
 
-            z = np.concatenate(p2)
-            coef_p2 = polyfit2d(x, y, z, degree=self.fit_degree, loss="arctan")
+            # Fit each curvature term separately
+            fitted_coeffs = []
+            for i in range(self.curve_degree):
+                z = np.concatenate([c[:, i] for c in all_coeffs])
+                coef = polyfit2d(x, y, z, degree=self.fit_degree, loss="arctan")
+                fitted_coeffs.append(coef)
+            fitted_coeffs = np.array(fitted_coeffs)
 
-        return coef_p1, coef_p2
+        return fitted_coeffs
 
-    def eval(self, peaks, order, coef_p1, coef_p2):
+    def eval(self, peaks, order, fitted_coeffs):
+        """Evaluate fitted curvature coefficients at given positions.
+
+        Parameters
+        ----------
+        peaks : array
+            Column positions to evaluate at
+        order : array
+            Order indices (same shape as peaks)
+        fitted_coeffs : array
+            Fitted coefficients from fit() method
+
+        Returns
+        -------
+        coeffs : array of shape (len(peaks), curve_degree)
+            Evaluated curvature coefficients at each position
+        """
+        coeffs = np.zeros((len(peaks), self.curve_degree))
+
         if self.mode == "1D":
-            p1 = np.zeros(peaks.shape)
-            p2 = np.zeros(peaks.shape)
+            # fitted_coeffs has shape (n_orders, curve_degree, fit_degree + 1)
             for i in np.unique(order):
                 idx = order == i
-                p1[idx] = np.polyval(coef_p1[i], peaks[idx])
-                p2[idx] = np.polyval(coef_p2[i], peaks[idx])
+                for j in range(self.curve_degree):
+                    coeffs[idx, j] = np.polyval(fitted_coeffs[int(i), j], peaks[idx])
         elif self.mode == "2D":
-            p1 = polyval2d(peaks, order, coef_p1)
-            p2 = polyval2d(peaks, order, coef_p2)
+            # fitted_coeffs has shape (curve_degree, ...)
+            for j in range(self.curve_degree):
+                coeffs[:, j] = polyval2d(peaks, order, fitted_coeffs[j])
+
+        return coeffs
+
+    def eval_legacy(self, peaks, order, fitted_coeffs):
+        """Evaluate and return legacy p1, p2 format for backward compatibility."""
+        coeffs = self.eval(peaks, order, fitted_coeffs)
+        p1 = coeffs[:, 0] if self.curve_degree >= 1 else np.zeros(len(peaks))
+        p2 = coeffs[:, 1] if self.curve_degree >= 2 else np.zeros(len(peaks))
         return p1, p2
 
     def plot_results(
-        self, ncol, plot_peaks, plot_vec, plot_p1, plot_p2, p1_x, p2_x
+        self, ncol, plot_peaks, plot_vec, plot_coeffs, fitted_coeffs
     ):  # pragma: no cover
+        """Plot curvature fitting results.
+
+        Parameters
+        ----------
+        ncol : int
+            Number of columns in image
+        plot_peaks : list of arrays
+            Peak columns for each order
+        plot_vec : list of arrays
+            Middle spectrum for each order
+        plot_coeffs : list of arrays
+            Raw curvature coefficients for each order
+        fitted_coeffs : array
+            Fitted coefficients from fit() method
+        """
         fig, axes = plt.subplots(nrows=self.n // 2 + self.n % 2, ncols=2, squeeze=False)
 
         title = "Peaks"
@@ -513,36 +639,53 @@ class Curvature:
                 ax.remove()
             return axs[:N]
 
-        t, s = [None for _ in range(self.n)], [None for _ in range(self.n)]
+        # Evaluate fitted coefficients for plotting
+        t = [None for _ in range(self.n)]  # c1 (linear term)
+        s = [None for _ in range(self.n)]  # c2 (quadratic term)
         for j in range(self.n):
             cr = self.column_range[j]
             x = np.arange(cr[0], cr[1])
             order = np.full(len(x), j)
-            t[j], s[j] = self.eval(x, order, p1_x, p2_x)
+            coeffs_eval = self.eval(x, order, fitted_coeffs)
+            t[j] = coeffs_eval[:, 0] if self.curve_degree >= 1 else np.zeros(len(x))
+            s[j] = coeffs_eval[:, 1] if self.curve_degree >= 2 else np.zeros(len(x))
 
-        t_lower = min(t.min() * (0.5 if t.min() > 0 else 1.5) for t in t)
-        t_upper = max(t.max() * (1.5 if t.max() > 0 else 0.5) for t in t)
+        t_lower = min(arr.min() * (0.5 if arr.min() > 0 else 1.5) for arr in t)
+        t_upper = max(arr.max() * (1.5 if arr.max() > 0 else 0.5) for arr in t)
 
-        s_lower = min(s.min() * (0.5 if s.min() > 0 else 1.5) for s in s)
-        s_upper = max(s.max() * (1.5 if s.max() > 0 else 0.5) for s in s)
+        s_lower = min(arr.min() * (0.5 if arr.min() > 0 else 1.5) for arr in s)
+        s_upper = max(arr.max() * (1.5 if arr.max() > 0 else 0.5) for arr in s)
 
         for j in range(self.n):
             cr = self.column_range[j]
-            peaks = plot_peaks[j].astype(int)
+            peaks = (
+                plot_peaks[j].astype(int) if len(plot_peaks[j]) > 0 else np.array([])
+            )
             vec = np.clip(plot_vec[j], 0, None)
-            p1 = plot_p1[j]
-            p2 = plot_p2[j]
+            raw_coeffs = plot_coeffs[j]
+            p1 = (
+                raw_coeffs[:, 0]
+                if raw_coeffs.shape[0] > 0 and self.curve_degree >= 1
+                else np.array([])
+            )
+            p2 = (
+                raw_coeffs[:, 1]
+                if raw_coeffs.shape[0] > 0 and self.curve_degree >= 2
+                else np.array([])
+            )
             x = np.arange(cr[0], cr[1])
+
             # Figure Peaks found (and used)
             axes[j // 2, j % 2].plot(np.arange(cr[0], cr[1]), vec)
-            axes[j // 2, j % 2].plot(peaks, vec[peaks - cr[0]], "X")
+            if len(peaks) > 0:
+                axes[j // 2, j % 2].plot(peaks, vec[peaks - cr[0]], "X")
             axes[j // 2, j % 2].set_xlim([0, ncol])
-            # axes[j // 2, j % 2].set_yscale("log")
             if j not in (self.n - 1, self.n - 2):
                 axes[j // 2, j % 2].get_xaxis().set_ticks([])
 
             # Figure 1st order
-            axes1[j // 2, j % 2].plot(peaks, p1, "rX")
+            if len(peaks) > 0 and len(p1) > 0:
+                axes1[j // 2, j % 2].plot(peaks, p1, "rX")
             axes1[j // 2, j % 2].plot(x, t[j])
             axes1[j // 2, j % 2].set_xlim(0, ncol)
 
@@ -552,10 +695,11 @@ class Curvature:
             else:
                 axes1[j // 2, j % 2].set_xlabel("x [pixel]")
             if j == self.n // 2 + 1:
-                axes1[j // 2, j % 2].set_ylabel("p1 [pixel/pixel]")
+                axes1[j // 2, j % 2].set_ylabel("c1 [pixel/pixel]")
 
             # Figure 2nd order
-            axes2[j // 2, j % 2].plot(peaks, p2, "rX")
+            if len(peaks) > 0 and len(p2) > 0:
+                axes2[j // 2, j % 2].plot(peaks, p2, "rX")
             axes2[j // 2, j % 2].plot(x, s[j])
             axes2[j // 2, j % 2].set_xlim(0, ncol)
 
@@ -565,23 +709,40 @@ class Curvature:
             else:
                 axes2[j // 2, j % 2].set_xlabel("x [pixel]")
             if j == self.n // 2 + 1:
-                axes2[j // 2, j % 2].set_ylabel("p2 [pixel/pixel**2]")
+                axes2[j // 2, j % 2].set_ylabel("c2 [pixel/pixel**2]")
 
         axes1 = trim_axs(axes1, self.n)
         axes2 = trim_axs(axes2, self.n)
 
         util.show_or_save("curvature_fit")
 
-    def plot_comparison(self, original, p1, p2, peaks):  # pragma: no cover
+    def plot_comparison(
+        self, original, coeffs_array, peaks, slitdeltas=None
+    ):  # pragma: no cover
+        """Plot comparison of curvature model vs data.
+
+        Parameters
+        ----------
+        original : array
+            Original image
+        coeffs_array : array of shape (ntrace, ncol, curve_degree + 1)
+            Curvature coefficients at each point
+        peaks : list of arrays
+            Peak columns for each order
+        slitdeltas : array of shape (ntrace, nrows), optional
+            Per-row residual offsets. If provided, plotted as white lines
+            offset from the polynomial (red lines).
+        """
         plt.figure()
         _, ncol = original.shape
         output = np.zeros((np.sum(self.curve_height) + self.ntrace, ncol))
         pos = [0]
         x = np.arange(ncol)
         for i in range(self.ntrace):
-            ycen = np.polyval(self.traces[i], x)
-            yb = ycen - self.curve_height[i, 0]
-            yt = ycen + self.curve_height[i, 1]
+            ycen = np.polyval(self.traces[i].pos, x)
+            half = self.curve_height[i] // 2
+            yb = ycen - half
+            yt = yb + self.curve_height[i] - 1
             xl, xr = self.column_range[i]
             index = make_index(yb, yt, xl, xr)
             yl = pos[i]
@@ -594,15 +755,35 @@ class Curvature:
 
         for i in range(self.ntrace):
             for p in peaks[i]:
+                p = int(p)
+                if p >= coeffs_array.shape[1]:
+                    continue
                 ew = self.curve_height[i]
-                x = np.zeros(ew[0] + ew[1] + 1)
-                y = np.arange(-ew[0], ew[1] + 1)
-                for j, yt in enumerate(y):
-                    x[j] = p + yt * p1[i, p] + yt**2 * p2[i, p]
-                y += pos[i] + ew[0]
-                plt.plot(x, y, "r")
+                half = ew // 2
+                curve_x = np.zeros(ew)
+                y_offsets = np.arange(-half, ew - half)
+                for j, yt in enumerate(y_offsets):
+                    # Evaluate polynomial: dx = c1*y + c2*y^2 + ...
+                    dx = 0
+                    for k in range(self.curve_degree):
+                        dx += coeffs_array[i, p, k + 1] * (yt ** (k + 1))
+                    curve_x[j] = p + dx
+                y_plot = y_offsets + pos[i] + half
+                # Red line: polynomial curvature only
+                plt.plot(curve_x, y_plot, "r", linewidth=1)
 
-        locs = np.sum(self.curve_height, axis=1) + 1
+                # White line: polynomial + slitdeltas (if available)
+                if slitdeltas is not None and i < slitdeltas.shape[0]:
+                    # Interpolate slitdeltas to curve_height resolution
+                    sd = slitdeltas[i]
+                    if len(sd) != ew:
+                        sd_x = np.linspace(0, 1, len(sd))
+                        curve_x_interp = np.linspace(0, 1, ew)
+                        sd = np.interp(curve_x_interp, sd_x, sd)
+                    curve_x_with_delta = curve_x + sd
+                    plt.plot(curve_x_with_delta, y_plot, "w", linewidth=0.5, alpha=0.8)
+
+        locs = self.curve_height + 1
         locs = np.array([0, *np.cumsum(locs)[:-1]])
         locs[:-1] += (np.diff(locs) * 0.5).astype(int)
         locs[-1] += ((output.shape[0] - locs[-1]) * 0.5).astype(int)
@@ -614,20 +795,68 @@ class Curvature:
         plt.ylabel("order")
         util.show_or_save("curvature_comparison")
 
-    def execute(self, original):
+    def _compute_slitdeltas(self, all_offsets, all_residuals, nrows):
+        """Compute per-row slitdeltas from fit residuals.
+
+        For each trace, average residuals across peaks at each offset,
+        then interpolate to per-row values.
+
+        Parameters
+        ----------
+        all_offsets : list of arrays
+            Y-offsets used for each order
+        all_residuals : list of arrays
+            Fit residuals, shape (n_peaks, n_offsets) per order
+        nrows : int
+            Number of rows covering curve_height range
+
+        Returns
+        -------
+        slitdeltas : array of shape (ntrace, nrows)
+            Per-row residual offsets for each trace, covering curve_height range.
+            During extraction, interpolated to match swath size.
+        """
+        slitdeltas = np.zeros((self.n, nrows))
+
+        for j in range(self.n):
+            offsets = all_offsets[j]
+            residuals = all_residuals[j]
+
+            if len(residuals) == 0 or np.all(np.isnan(residuals)):
+                continue
+
+            # Average residuals across peaks at each offset (ignoring NaN)
+            mean_resid = np.nanmedian(residuals, axis=0)
+
+            # Map offsets to row indices
+            # offsets are relative to trace center
+            xwd = self.curve_height[j]
+            half = xwd // 2
+            row_offsets = np.linspace(-half, xwd - half, nrows)
+
+            # Interpolate from measured offsets to per-row
+            valid = ~np.isnan(mean_resid)
+            if np.sum(valid) >= 2:
+                slitdeltas[j] = np.interp(
+                    row_offsets, offsets[valid], mean_resid[valid], left=0, right=0
+                )
+
+        return slitdeltas
+
+    def execute(self, original, compute_slitdeltas=True):
         """Execute curvature determination using row-tracking method.
 
         Parameters
         ----------
         original : array of shape (nrow, ncol)
             Original image
+        compute_slitdeltas : bool
+            Whether to compute slitdeltas from fit residuals (default: True)
 
         Returns
         -------
-        p1 : array of shape (ntrace, ncol)
-            First order slit curvature at each point
-        p2 : array of shape (ntrace, ncol)
-            Second order slit curvature at each point
+        dict
+            Curvature data with keys: coeffs, slitdeltas, degree, fitted_coeffs, fit_degree.
         """
         logger.info("Determining the Slit Curvature")
 
@@ -635,21 +864,63 @@ class Curvature:
 
         self._fix_inputs(original)
 
-        peaks, p1, p2, vec = self._determine_curvature_all_lines(original)
+        peaks, all_coeffs, all_offsets, all_residuals, vec = (
+            self._determine_curvature_all_lines(original)
+        )
 
-        coef_p1, coef_p2 = self.fit(peaks, p1, p2)
+        fitted_coeffs = self.fit(peaks, all_coeffs)
 
         if self.plot:  # pragma: no cover
-            self.plot_results(ncol, peaks, vec, p1, p2, coef_p1, coef_p2)
+            self.plot_results(ncol, peaks, vec, all_coeffs, fitted_coeffs)
 
-        # Create output arrays (ntrace, ncol)
+        # Create output array (ntrace, ncol, curve_degree + 1)
         iorder, ipeaks = np.indices((self.n, ncol))
-        p1, p2 = self.eval(ipeaks, iorder, coef_p1, coef_p2)
+        coeffs_flat = self.eval(ipeaks.ravel(), iorder.ravel(), fitted_coeffs)
+        # coeffs_flat has shape (n * ncol, curve_degree)
+
+        # Build full coefficient array with c0 = 0
+        coeffs = np.zeros((self.n, ncol, self.curve_degree + 1))
+        coeffs[:, :, 1:] = coeffs_flat.reshape(self.n, ncol, self.curve_degree)
+
+        # Compute slitdeltas from residuals
+        slitdeltas = None
+        if compute_slitdeltas:
+            # Use max curve height to determine nrows (full measured range)
+            max_curve = int(np.max(self.curve_height)) + 1
+            slitdeltas = self._compute_slitdeltas(all_offsets, all_residuals, max_curve)
+            logger.info(
+                "Computed slitdeltas with shape %s, range [%.4f, %.4f]",
+                slitdeltas.shape,
+                np.nanmin(slitdeltas),
+                np.nanmax(slitdeltas),
+            )
 
         if self.plot:  # pragma: no cover
-            self.plot_comparison(original, p1, p2, peaks)
+            self.plot_comparison(original, coeffs, peaks, slitdeltas=slitdeltas)
 
-        return p1, p2
+        # Build compact fitted_coeffs with c0=0 row prepended
+        # fitted_coeffs from fit() has shape (ntrace, curve_degree, fit_degree+1) for 1D mode
+        # We want (ntrace, curve_degree+1, fit_degree+1) with c0 row = 0
+        if self.mode == "1D":
+            compact = np.zeros(
+                (self.n, self.curve_degree + 1, self.fit_degree + 1),
+                dtype=np.float64,
+            )
+            compact[:, 1:, :] = fitted_coeffs
+            fit_deg = self.fit_degree
+        else:
+            # 2D mode: fitted_coeffs has shape (curve_degree, ...) - more complex
+            # For now, only store compact form for 1D mode
+            compact = None
+            fit_deg = None
+
+        return {
+            "coeffs": coeffs,
+            "slitdeltas": slitdeltas,
+            "degree": self.curve_degree,
+            "fitted_coeffs": compact,
+            "fit_degree": fit_deg,
+        }
 
 
 # TODO allow other line shapes

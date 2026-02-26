@@ -1,6 +1,103 @@
 # Changelog
 
 
+## [0.8a5] - 2026-02-25
+
+### Added
+- ANDES_UBV instrument, IZ channel for ANDES_RIZ, per-channel settings files
+- Preserve individual fiber traces alongside merged group traces
+- Tests for `get_y_scale` covering standard, edge, and invariant cases
+
+### Fixed
+- Center extraction window on trace peak (+0.5/+1 shift for odd/even height)
+- Fix `get_y_scale` silently mutating caller's ycen array
+- Fix slit function plot alignment in ProgressPlot
+- Fix curvature save: match traces by (m, group) instead of index
+- Recompute heights after merging even/odd fibers (use nearest neighbor)
+- Fix test warnings: tempfile leak, divide-by-zero, misplaced instrument test
+- Guard against empty order_centers YAML files
+
+## [0.8a4] - 2026-02-14
+
+### Added
+- HARPSPOL instrument with dual-beam (Wollaston prism) support
+- Otsu+DP beam-pair detection for multi-fiber trace pairing
+- `--use` CLI flag to select fiber groups (e.g., `--use upper,lower`)
+- Wavelength propagation from trace into extracted Spectrum
+
+### Changed
+- Output files go into per-night subdirectory (`reduced/{night}/`)
+- Group filenames use `{prefix}_{group}.{step}.{ext}` convention
+- Traces without order_centers get sequential m values (was None)
+
+### Fixed
+- Fix `create_image_from_lines` row count (use ntrace, not order range)
+- Fix 2D wavecal polynomial eval: use trace index, not physical order m
+- Fix multi-channel filename overwrite (include channel in science/rectify)
+- Fix linelist order drift across re-runs (normalize to 0-based on save)
+- Fix output_dir CLI default (None, so config's `reduced/{night}` is used)
+
+## [0.8a3] - 2026-02-11
+
+### Changed
+- Replace MCMC-based `wavecal_init` with iterative peak matching algorithm
+- Remove `emcee` and `corner` dependencies
+
+### Fixed
+- Fix continuum trace count mismatch when norm_flat drops edge traces
+- Fix extraction_height precedence: settings over trace.height
+- Fix LFC plot crash on negative orders and Finalize trace selection
+- Fix 2D wavecal poly eval, continuum trace selection, and numeric guards
+- Fix wavecal/freq_comb trace data flow and continuum trace mismatch
+
+## [0.8a2] - 2026-02-03
+
+### Added
+- `Trace` dataclass (trace_model.py) for unified trace data model
+- `Spectrum`/`Spectra` classes (spectra.py) replacing legacy Echelle format
+- `Trace.wlen(x)` method to evaluate wavelength polynomial
+- Per-group wavelength calibration support
+- LFC wavecal support for ANDES_RIZ
+- docs/output_formats.md documenting new file formats
+
+### Changed
+- All pipeline steps use `list[Trace]` interface instead of array-based
+- `extract()` takes `list[Trace]`, returns `list[Spectrum]`
+- Renamed `nord`/`iord` to `ntrace`/`idx` for clarity
+- Renamed `Trace.fiber` to `Trace.group`, added `fiber_idx` for per-fiber wavecal
+- File format: traces.npz -> traces.fits (unified FITS format)
+- Wavelength calibration stored in traces.fits instead of separate wavecal.npz
+- Spectra use NaN masking instead of COLUMNS+MASK redundancy
+
+### Removed
+- `curvature_model.py` (curvature now stored in Trace)
+- `echelle.py` functionality (deprecated, use spectra.py)
+- Dead code from util.py
+
+## [0.8a1] - 2026-02-03
+
+### Added
+- Charslit extraction backend with degree 1-5 curvature support
+- ANDES_RIZ instrument configuration and settings
+- `trace_by` config for separate tracing of illumination groups
+- HDF-to-wavecal tool and reference files for ANDES_RIZ
+- ANDES spectra plotting tool
+
+### Changed
+- Curvature: use literal pixel extraction_height, not fractional
+- Simplify extraction_height to single full-height value
+- Move fiber selection default from hardcoded to config
+- Update METIS_IFU for dynamic wavelength-based channels
+- Use git URL for charslit optional dependency
+
+### Removed
+- PEP 723 inline metadata from examples (caused confusion with `uv run`)
+
+### Fixed
+- Fix curve_height to use new full-height format in plot_comparison
+- Fix extraction_height to give exactly N rows
+- Fix CRIRES_PLUS docstring (was incorrectly HARPS)
+
 ## [0.7] - 2026-01-25
 
 First stable release of the 0.7 series!

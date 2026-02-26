@@ -1,3 +1,19 @@
+## What's New in PyReduce 0.8 ?
+
+### Unified Trace Data Model
+
+The `Trace` dataclass now holds all trace-related data in one place: position polynomial, slit curvature, and wavelength calibration. Pipeline steps update traces in-place as they run, eliminating separate `.curve.npz` and `.wavecal.npz` files. All trace data is saved to a single `.traces.fits` file.
+
+See [docs/redesign.md](docs/redesign.md) for a full summary of all architectural changes in 0.7/0.8.
+
+### New Spectra Format
+
+Extracted spectra use a new per-trace FITS format with NaN masking, replacing the legacy Echelle class. Each spectrum row includes order number, group ID, and extraction metadata.
+
+See [docs/output_formats.md](docs/output_formats.md) for the file format specification.
+
+---
+
 ## What's New in PyReduce 0.7 ?
 
 ### Multi-Fiber Instrument Support
@@ -72,7 +88,7 @@ The old argparse CLI is replaced with a cleaner Click-based interface. See [docs
 ### Installation & Build
 
 - Now uses `uv` package manager (`uv sync`, `uv run reduce ...`), but `pip install pyreduce-astro` still works
-- **Python 3.11+** required (3.13 recommended)
+- **Python 3.13+** required
 - Build system migrated from setuptools to Hatchling
 
 See [docs/installation.md](docs/installation.md) for details.

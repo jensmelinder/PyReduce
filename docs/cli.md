@@ -42,8 +42,9 @@ uv run reduce run INSTRUMENT [OPTIONS]
 | `--plot` | `-p` | Plot level: 0=none, 1=basic, 2=detailed |
 | `--plot-dir` | | Save plots to this directory as PNG files |
 | `--plot-show` | | Display mode: block, defer, or off |
-| `--order-range` | | Order range to process (e.g., "1,21") |
+| `--trace-range` | | Trace range to process (e.g., "1,21") |
 | `--settings` | | JSON file with settings overrides |
+| `--use` | | Fiber group(s) to reduce (e.g., "upper" or "upper,lower") |
 
 **Examples:**
 
@@ -193,14 +194,17 @@ PyReduce expects the following directory structure:
 $REDUCE_DATA/
   INSTRUMENT/
     raw/
-      *.fits         # Input FITS files
-    reduced/
-      *_bias.fits    # Master bias
-      *_flat.fits    # Master flat
-      *.traces.npz   # Traces and extraction heights
-      *.science.fits # Extracted spectra
-      *.final.fits   # Final output
+      *.fits                    # Input FITS files
+    reduced/{night}/
+      {inst}_{chan}.bias.fits   # Master bias
+      {inst}_{chan}.flat.fits   # Master flat
+      {inst}_{chan}.traces.fits # Traces and wavelength polynomials
+      *.{chan}.science.fits     # Extracted spectra
+      *.{chan}.final.fits       # Final output
 ```
+
+For multi-fiber instruments, group-specific files use the pattern
+`{inst}_{chan}_{group}.{step}.{ext}` (e.g., `harpspol_blue_upper.linelist.npz`).
 
 The base directory can be set via:
 1. `--base-dir` option

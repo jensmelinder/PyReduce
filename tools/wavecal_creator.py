@@ -1,7 +1,7 @@
 """
 This script creates a new linelist file based on an atlas for a specific element of the gas lamp
 used in the wavelength calibration. The best match between the atlas and the observed spectrum
-is found using MCMC.
+is found using iterative peak matching.
 """
 
 from os.path import dirname, join
@@ -21,7 +21,7 @@ instrument = instrument_info.load_instrument("HARPS")
 wave_range = instrument.get_wavelength_range(None, "red")
 
 # Run the linelist module
-module = WavelengthCalibrationInitialize(element="thar", medium="vac", plot=True)
+module = WavelengthCalibrationInitialize(atlas_name="thar", medium="vac", plot=True)
 linelist = module.execute(thar_spec, wave_range)
 
 # Save the linelist

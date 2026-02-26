@@ -7,12 +7,18 @@ PyReduce supports multi-fiber instruments where each spectral order contains mul
 ## Terminology
 
 - **Trace**: Polynomial describing one fiber's path across detector
-- **Fiber**: Physical fiber in bundle (numbered 1-N)
+- **Fiber**: Physical fiber in bundle (numbered 1-N within each order/group)
 - **Group**: Named collection of fibers with semantic meaning (e.g., "A", "cal", "B"). Use groups when fibers have distinct roles - science targets, calibration sources, sky fibers, etc.
 - **Bundle**: Numbered groups of identical fibers (e.g., "bundle_1", "bundle_2", ...). Use bundles for repeating patterns like IFU spaxels where each bundle has the same structure.
 - **Spectral Order**: Wavelength range; multi-order instruments have same fiber pattern repeated across orders
+- **fiber_idx**: Index of a fiber within its group/order (1-indexed). Used for per-fiber wavelength calibration.
 
 In short: **groups** are for named, semantically distinct fiber sets; **bundles** are for numbered, structurally identical fiber sets.
+
+Each `Trace` object has:
+- `m`: Spectral order number (physical diffraction order)
+- `group`: Group/bundle identifier ("A", "B", "cal", or bundle index)
+- `fiber_idx`: Fiber index within the group (1-indexed), or None if merged
 
 ## Configuration
 
@@ -91,12 +97,11 @@ This approach handles arbitrary patterns of missing fibers without requiring the
 
 ### Per-Order Grouping (echelle multi-fiber)
 
-For echelle instruments where fiber groups repeat across spectral orders (e.g., AJ with 75 fibers per order across 18 orders):
+For echelle instruments where fiber groups repeat across spectral orders (e.g., ANDES_YJH with 75 fibers per order across 18 orders):
 
 ```yaml
 fibers:
-  per_order: true
-  fibers_per_order: 75              # Expected fibers per order (validation)
+  fibers_per_order: 75              # Enables per-order organization
   order_centers_file: order_centers.yaml  # Or inline with order_centers:
 
   groups:
@@ -116,6 +121,8 @@ fibers:
     norm_flat: all
 ```
 
+Setting `fibers_per_order` enables per-order organization (no separate `per_order: true` needed).
+
 The `order_centers.yaml` file maps spectral order numbers to y-positions at detector center:
 
 ```yaml
@@ -130,7 +137,7 @@ Or inline for instruments with few orders:
 
 ```yaml
 fibers:
-  per_order: true
+  fibers_per_order: 3
   order_centers:
     1: 150.5
     2: 320.3
@@ -145,9 +152,8 @@ For instruments with multiple channels (detectors/arms), per-order fields can be
 channels: [UVB, VIS, NIR]
 
 fibers:
-  per_order: true
-  order_centers_file: [uvb_centers.yaml, vis_centers.yaml, nir_centers.yaml]
   fibers_per_order: [75, 75, 60]  # Can vary per channel
+  order_centers_file: [uvb_centers.yaml, vis_centers.yaml, nir_centers.yaml]
 
   groups:  # Same structure across all channels
     A: {range: [1, 36], merge: average}
@@ -169,32 +175,43 @@ The `use` section specifies which traces each reduction step receives:
 - `all` - All individual fiber traces (ignores grouping)
 - `groups` - All merged group/bundle traces stacked
 - `[A, B]` - Specific named groups (kept separate in output)
+- `per_fiber` - Traces grouped by `fiber_idx` for per-fiber processing
 
 Steps not listed in `use` default to `groups` when groups/bundles are defined.
 
+### Per-Fiber Wavelength Calibration
+
+For 2D wavelength calibration (`dimensionality: "2D"`), all traces in a fit must share the same optical path. When multiple fibers exist per order:
+
+```yaml
+fibers:
+  use:
+    wavecal: [A]        # One 2D fit for group A across all orders
+    # OR
+    wavecal: [A, B]     # Separate 2D fits for A and B
+    # OR
+    wavecal: per_fiber  # Separate 2D fit per fiber_idx
+```
+
+With `per_fiber`, each unique `fiber_idx` gets its own 2D polynomial fit. This is useful when fibers have slightly different wavelength solutions and you want to calibrate each independently.
+
 ## Output Format
 
-Tracing saves both raw and grouped traces to the `.traces.npz` file.
+Tracing saves all traces to a FITS binary table (`.traces.fits`) with one row per trace:
 
-For per_order=False:
-```
-traces          - Raw traces (n_fibers, degree+1)
-column_range    - Raw column ranges (n_fibers, 2)
-heights         - Per-trace extraction heights in pixels (n_fibers,)
-group_A_traces  - Merged traces for group A
-group_A_cr      - Column ranges for group A
-group_A_height  - Extraction height for group A (scalar, pixels)
-```
+| Column | Type | Description |
+|--------|------|-------------|
+| M | int16 | Spectral order number (-1 if N/A) |
+| GROUP | 16A | Group/bundle identifier ('A', 'B', 'cal', etc.) |
+| FIBER_IDX | int16 | Fiber index within group (1-indexed, -1 if N/A) |
+| POS | float64[deg+1] | Position polynomial coefficients |
+| COL_RANGE | int32[2] | Valid x range [start, end) |
+| HEIGHT | float32 | Extraction aperture height in pixels |
+| SLIT | float64[...] | Curvature coefficients (if available) |
+| SLITDELTA | float32[...] | Per-row curvature residuals (if available) |
+| WAVE | float64[...] | Wavelength polynomial (if available) |
 
-For per_order=True:
-```
-traces          - Raw traces (n_total_fibers, degree+1)
-column_range    - Raw column ranges
-heights         - Per-trace extraction heights in pixels
-A_order_90      - Merged trace for group A in spectral order 90
-A_cr_90         - Column range for group A in spectral order 90
-...
-```
+The `GROUP` column identifies which group/bundle each trace belongs to. The `FIBER_IDX` column identifies the fiber within the group (1-indexed). For merged groups, multiple raw fibers become a single trace with the group name and `FIBER_IDX = -1`.
 
 ### Automatic Extraction Heights
 
@@ -209,13 +226,23 @@ For groups/bundles, heights are derived from fiber spacing within each group (sp
 
 ## Example Instruments
 
-### AJ (75 fibers x 18 orders)
+### ANDES_UBV / ANDES_RIZ (66 fibers per order)
 
-Simulated echelle with science fibers A/B and calibration fiber:
-- Fibers 1-35: Science fiber A
-- Fibers 37-39: Calibration fiber
-- Fibers 40-75: Science fiber B
-- Uses `per_order: true` with `order_centers_file`
+Simulated echelle spectrographs for visible wavelengths:
+- Fibers 1-31: Slit A
+- Fibers 33-35: Calibration
+- Fibers 36-66: Slit B
+- ANDES_UBV: channels U, B, V (selected by `BAND` header)
+- ANDES_RIZ: channels R, R1, R2, IZ (selected by `HDFMODEL` header, since R variants all have `BAND=R`)
+
+### ANDES_YJH (75 fibers per order)
+
+Simulated NIR echelle with science fibers A/B, calibration, and IFU:
+- Fibers 1-35: Slit A
+- Fibers 37-39: Calibration
+- Fibers 40-75: Slit B
+- Additional groups: ifu, ring0-4 (subsets of the fiber bundle)
+- Channels Y, J, H (selected by `BAND` header)
 
 ### MOSAIC (630 fibers, single order)
 
