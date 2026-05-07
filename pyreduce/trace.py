@@ -1378,6 +1378,7 @@ def group_fibers(
     elif fibers_config.bundles is not None:
         bundle_cfg = fibers_config.bundles
         bundle_size = bundle_cfg.size
+        
 
         for m, order_traces in sorted(traces_by_m.items()):
             n_in_order = len(order_traces)
